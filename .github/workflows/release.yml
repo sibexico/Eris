@@ -84,6 +84,20 @@ jobs:
             sudo apt-get install -y build-essential pkg-config xorg-dev libgl1-mesa-dev dpkg-dev lintian
           fi
 
+      - name: Install Windows ARM64 cgo toolchain
+        if: matrix.goos == 'windows' && matrix.goarch == 'arm64'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $url = 'https://github.com/mstorsjo/llvm-mingw/releases/download/20241029/llvm-mingw-20241029-ucrt-x86_64.zip'
+          $zip = Join-Path $env:RUNNER_TEMP 'llvm-mingw.zip'
+          $dir = Join-Path $env:RUNNER_TEMP 'llvm-mingw'
+          Invoke-WebRequest -Uri $url -OutFile $zip
+          Expand-Archive -Path $zip -DestinationPath $dir -Force
+          $root = Get-ChildItem -Path $dir -Directory | Select-Object -First 1
+          $bin = Join-Path $root.FullName 'bin'
+          "${bin}" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+
       - name: Build binary
         shell: pwsh
         env:
@@ -99,12 +113,16 @@ jobs:
             $env:CXX = "aarch64-linux-gnu-g++"
             $env:PKG_CONFIG_LIBDIR = "/usr/lib/aarch64-linux-gnu/pkgconfig:/usr/share/pkgconfig"
           }
+          if ($env:GOOS -eq "windows" -and $env:GOARCH -eq "arm64") {
+            $env:CC = "aarch64-w64-mingw32-gcc"
+            $env:CXX = "aarch64-w64-mingw32-g++"
+          }
           if ($env:GOOS -eq "windows") {
             $out = "dist/eris_${env:VERSION}_windows_${env:ASSET_ARCH}.exe"
             go build -trimpath -ldflags "-s -w -H=windowsgui" -o $out .
           } else {
             $out = "dist/eris_${env:VERSION}_linux_${env:ASSET_ARCH}"
-            go build -trimpath -ldflags "-s -w" -o $out .
+            go build -trimpath -buildmode=pie -ldflags "-s -w" -o $out .
           }
 
       - name: Package Linux binary archive
@@ -148,10 +166,24 @@ jobs:
           mkdir -p "${pkgroot}/usr/share/applications"
           mkdir -p "${pkgroot}/usr/share/icons/hicolor/512x512/apps"
           mkdir -p "${pkgroot}/usr/share/doc/${PKG_NAME}"
+          mkdir -p "${pkgroot}/usr/share/man/man1"
 
           install -m 0755 "dist/eris_${VERSION}_linux_${ASSET_ARCH}" "${pkgroot}/usr/bin/${PKG_NAME}"
-          install -m 0644 icon.png "${pkgroot}/usr/share/icons/hicolor/512x512/apps/${PKG_NAME}.png"
+          install -m 0644 icon512.png "${pkgroot}/usr/share/icons/hicolor/512x512/apps/${PKG_NAME}.png"
           install -m 0644 README.md "${pkgroot}/usr/share/doc/${PKG_NAME}/README.md"
+
+          {
+            printf '%s\n' '.TH ERIS 1 "$(date +%Y-%m-%d)" "Eris" "User Commands"'
+            printf '%s\n' '.SH NAME'
+            printf '%s\n' 'eris - OpenPGP desktop workstation'
+            printf '%s\n' '.SH SYNOPSIS'
+            printf '%s\n' '\\fBeris\\fR'
+            printf '%s\n' '.SH DESCRIPTION'
+            printf '%s\n' 'Eris is a desktop application for encrypted vault storage and OpenPGP workflows.'
+            printf '%s\n' '.SH AUTHOR'
+            printf '%s\n' "${PKG_MAINTAINER}"
+          } > "${pkgroot}/usr/share/man/man1/${PKG_NAME}.1"
+          gzip -n -9 "${pkgroot}/usr/share/man/man1/${PKG_NAME}.1"
 
           sed \
             -e "s/__APP_NAME__/Eris/g" \
@@ -168,8 +200,8 @@ jobs:
             printf '%s\n' "  * Automated release build."
             printf '\n'
             printf '%s\n' " -- ${PKG_MAINTAINER}  $(date -R)"
-          } > "${pkgroot}/usr/share/doc/${PKG_NAME}/changelog.Debian"
-          gzip -n -9 "${pkgroot}/usr/share/doc/${PKG_NAME}/changelog.Debian"
+          } > "${pkgroot}/usr/share/doc/${PKG_NAME}/changelog"
+          gzip -n -9 "${pkgroot}/usr/share/doc/${PKG_NAME}/changelog"
 
           if [ -f LICENSE ]; then
             install -m 0644 LICENSE "${pkgroot}/usr/share/doc/${PKG_NAME}/copyright"
