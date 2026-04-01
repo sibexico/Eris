@@ -89,7 +89,13 @@ jobs:
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
-          $url = 'https://github.com/mstorsjo/llvm-mingw/releases/download/20241029/llvm-mingw-20241029-ucrt-x86_64.zip'
+          $apiUrl = 'https://api.github.com/repos/mstorsjo/llvm-mingw/releases/latest'
+          $release = Invoke-RestMethod -Uri $apiUrl -Headers @{ 'Accept' = 'application/vnd.github+json' }
+          $asset = $release.assets | Where-Object { $_.name -match '^llvm-mingw-.*-ucrt-x86_64\.zip$' } | Select-Object -First 1
+          if (-not $asset) {
+            throw 'Could not find llvm-mingw ucrt x86_64 archive in latest release assets.'
+          }
+          $url = $asset.browser_download_url
           $zip = Join-Path $env:RUNNER_TEMP 'llvm-mingw.zip'
           $dir = Join-Path $env:RUNNER_TEMP 'llvm-mingw'
           Invoke-WebRequest -Uri $url -OutFile $zip
