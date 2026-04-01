@@ -37,3 +37,9 @@ go build -o eris .
 ## Run
 - Windows: `./eris.exe`
 - Linux: `./eris`
+
+## Screenshots
+
+![Eris](screenshots/1.png)
+
+![Eris](screenshots/2.png)
