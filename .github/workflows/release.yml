@@ -1,0 +1,191 @@
+name: Release Builds
+
+on:
+  release:
+    types: [published]
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: windows-latest
+            goos: windows
+            goarch: amd64
+          - runner: windows-11-arm
+            goos: windows
+            goarch: arm64
+          - runner: ubuntu-latest
+            goos: linux
+            goarch: amd64
+          - runner: ubuntu-24.04-arm
+            goos: linux
+            goarch: arm64
+
+    runs-on: ${{ matrix.runner }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Parse release version from tag
+        id: version
+        shell: pwsh
+        run: |
+          $raw = "${{ github.ref_name }}"
+          $version = $raw -replace '^v\.?', ''
+          if ($version -notmatch '^\d+\.\d+\.\d+$') {
+            throw "Tag '$raw' is invalid. Expected vX.Y.Z or v.X.Y.Z"
+          }
+          "version=$version" >> $env:GITHUB_OUTPUT
+
+      - name: Compute naming metadata
+        id: meta
+        shell: pwsh
+        run: |
+          $goarch = "${{ matrix.goarch }}"
+          if ($goarch -eq "amd64") {
+            $assetArch = "x86_64"
+            $debArch = "amd64"
+          } elseif ($goarch -eq "arm64") {
+            $assetArch = "arm64"
+            $debArch = "arm64"
+          } else {
+            throw "Unsupported goarch: $goarch"
+          }
+          "asset_arch=$assetArch" >> $env:GITHUB_OUTPUT
+          "deb_arch=$debArch" >> $env:GITHUB_OUTPUT
+
+      - name: Install Linux build dependencies
+        if: matrix.goos == 'linux'
+        shell: bash
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential pkg-config xorg-dev libgl1-mesa-dev dpkg-dev lintian
+
+      - name: Build binary
+        shell: pwsh
+        env:
+          CGO_ENABLED: "1"
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+          VERSION: ${{ steps.version.outputs.version }}
+          ASSET_ARCH: ${{ steps.meta.outputs.asset_arch }}
+        run: |
+          New-Item -ItemType Directory -Force -Path dist | Out-Null
+          if ($env:GOOS -eq "windows") {
+            $out = "dist/eris_${env:VERSION}_windows_${env:ASSET_ARCH}.exe"
+            go build -trimpath -ldflags "-s -w -H=windowsgui" -o $out .
+          } else {
+            $out = "dist/eris_${env:VERSION}_linux_${env:ASSET_ARCH}"
+            go build -trimpath -ldflags "-s -w" -o $out .
+          }
+
+      - name: Build Debian package
+        if: matrix.goos == 'linux'
+        shell: bash
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+          DEB_ARCH: ${{ steps.meta.outputs.deb_arch }}
+          ASSET_ARCH: ${{ steps.meta.outputs.asset_arch }}
+        run: |
+          set -euo pipefail
+
+          rendered_control="pkg/control_${DEB_ARCH}.txt"
+          mkdir -p pkg
+          sed \
+            -e "s/__VERSION__/${VERSION}/g" \
+            -e "s/__ARCH__/${DEB_ARCH}/g" \
+            packaging/debian/control.template > "${rendered_control}"
+
+          PKG_NAME="$(awk -F': ' '/^Package:/ {print $2}' "${rendered_control}")"
+          PKG_MAINTAINER="$(awk -F': ' '/^Maintainer:/ {print $2}' "${rendered_control}")"
+          PKG_HOMEPAGE="$(awk -F': ' '/^Homepage:/ {print $2}' "${rendered_control}")"
+          PKG_DESC_SHORT="$(awk -F': ' '/^Description:/ {print $2}' "${rendered_control}")"
+          PKG_DESC_SHORT_ESCAPED="$(printf '%s' "${PKG_DESC_SHORT}" | sed -e 's/[\\/&]/\\\\&/g')"
+
+          pkgroot="pkg/${PKG_NAME}_${VERSION}_${DEB_ARCH}"
+          mkdir -p "${pkgroot}/DEBIAN"
+          mkdir -p "${pkgroot}/usr/bin"
+          mkdir -p "${pkgroot}/usr/share/applications"
+          mkdir -p "${pkgroot}/usr/share/icons/hicolor/512x512/apps"
+          mkdir -p "${pkgroot}/usr/share/doc/${PKG_NAME}"
+
+          install -m 0755 "dist/eris_${VERSION}_linux_${ASSET_ARCH}" "${pkgroot}/usr/bin/${PKG_NAME}"
+          install -m 0644 icon.png "${pkgroot}/usr/share/icons/hicolor/512x512/apps/${PKG_NAME}.png"
+          install -m 0644 README.md "${pkgroot}/usr/share/doc/${PKG_NAME}/README.md"
+
+          sed \
+            -e "s/__APP_NAME__/Eris/g" \
+            -e "s/__APP_COMMENT__/${PKG_DESC_SHORT_ESCAPED}/g" \
+            -e "s/__APP_BIN__/${PKG_NAME}/g" \
+            -e "s/__APP_ICON__/${PKG_NAME}/g" \
+            packaging/eris.desktop > "${pkgroot}/usr/share/applications/${PKG_NAME}.desktop"
+
+          install -m 0644 "${rendered_control}" "${pkgroot}/DEBIAN/control"
+
+          cat > "${pkgroot}/usr/share/doc/${PKG_NAME}/changelog.Debian" <<EOF
+          ${PKG_NAME} (${VERSION}) unstable; urgency=medium
+
+            * Automated release build.
+
+           -- ${PKG_MAINTAINER}  $(date -R)
+          EOF
+          gzip -n -9 "${pkgroot}/usr/share/doc/${PKG_NAME}/changelog.Debian"
+
+          if [ -f LICENSE ]; then
+            install -m 0644 LICENSE "${pkgroot}/usr/share/doc/${PKG_NAME}/copyright"
+          else
+            cat > "${pkgroot}/usr/share/doc/${PKG_NAME}/copyright" <<EOF
+            MIT License
+
+            Copyright (c) 2026 Nicolas Altmann
+
+            Permission is hereby granted, free of charge, to any person obtaining a copy
+            of this software and associated documentation files (the "Software"), to deal
+            in the Software without restriction, including without limitation the rights
+            to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+            copies of the Software, and to permit persons to whom the Software is
+            furnished to do so, subject to the following conditions:
+
+            The above copyright notice and this permission notice shall be included in all
+            copies or substantial portions of the Software.
+
+            THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+            IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+            FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+            AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+            LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+            OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+            SOFTWARE.
+            EOF
+          fi
+
+          cat > "${pkgroot}/usr/share/doc/${PKG_NAME}/upstream" <<EOF
+          Format: https://www.debian.org/doc/packaging-manuals/copyright-format/1.0/
+          Upstream-Name: ${PKG_NAME}
+          Source: ${PKG_HOMEPAGE}
+
+          Files: *
+          Copyright: 2026 Eris contributors
+          License: MIT
+           See /usr/share/doc/${PKG_NAME}/copyright for full MIT license text.
+          EOF
+
+          dpkg-deb --build --root-owner-group "${pkgroot}" "dist/${PKG_NAME}_${VERSION}_linux_${ASSET_ARCH}.deb"
+          lintian "dist/${PKG_NAME}_${VERSION}_linux_${ASSET_ARCH}.deb"
+
+      - name: Upload release assets
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          fail_on_unmatched_files: true

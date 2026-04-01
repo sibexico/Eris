@@ -1,0 +1,10 @@
+Package: eris
+Version: __VERSION__
+Section: utils
+Priority: optional
+Architecture: __ARCH__
+Maintainer: Nicolas Altmann <dev@sbexi.co>
+Depends: libc6 (>= 2.31), libgl1, libx11-6, libxcursor1, libxinerama1, libxi6, libxrandr2, libxxf86vm1
+Homepage: https://github.com/sibexico/Eris
+Description: Eris PGP desktop workstation
+ Eris is a desktop PGP workstation with sign/encrypt/decrypt/verify features.

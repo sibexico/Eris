@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=__APP_NAME__
+Comment=__APP_COMMENT__
+Exec=/usr/bin/__APP_BIN__
+Icon=__APP_ICON__
+Terminal=false
+Categories=Utility;Security;
+StartupNotify=true
