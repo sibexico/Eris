@@ -69,8 +69,20 @@ jobs:
         if: matrix.goos == 'linux'
         shell: bash
         run: |
+          set -euo pipefail
           sudo apt-get update
-          sudo apt-get install -y build-essential pkg-config xorg-dev libgl1-mesa-dev dpkg-dev lintian
+          if [ "${{ matrix.goarch }}" = "arm64" ]; then
+            sudo dpkg --add-architecture arm64
+            sudo apt-get update
+            sudo apt-get install -y \
+              build-essential pkg-config dpkg-dev lintian \
+              gcc-aarch64-linux-gnu g++-aarch64-linux-gnu libc6-dev-arm64-cross \
+              libgl1-mesa-dev:arm64 libx11-dev:arm64 libxcursor-dev:arm64 \
+              libxinerama-dev:arm64 libxi-dev:arm64 libxrandr-dev:arm64 \
+              libxxf86vm-dev:arm64
+          else
+            sudo apt-get install -y build-essential pkg-config xorg-dev libgl1-mesa-dev dpkg-dev lintian
+          fi
 
       - name: Build binary
         shell: pwsh
@@ -82,6 +94,11 @@ jobs:
           ASSET_ARCH: ${{ steps.meta.outputs.asset_arch }}
         run: |
           New-Item -ItemType Directory -Force -Path dist | Out-Null
+          if ($env:GOOS -eq "linux" -and $env:GOARCH -eq "arm64") {
+            $env:CC = "aarch64-linux-gnu-gcc"
+            $env:CXX = "aarch64-linux-gnu-g++"
+            $env:PKG_CONFIG_LIBDIR = "/usr/lib/aarch64-linux-gnu/pkgconfig:/usr/share/pkgconfig"
+          }
           if ($env:GOOS -eq "windows") {
             $out = "dist/eris_${env:VERSION}_windows_${env:ASSET_ARCH}.exe"
             go build -trimpath -ldflags "-s -w -H=windowsgui" -o $out .
@@ -89,6 +106,18 @@ jobs:
             $out = "dist/eris_${env:VERSION}_linux_${env:ASSET_ARCH}"
             go build -trimpath -ldflags "-s -w" -o $out .
           }
+
+      - name: Package Linux binary archive
+        if: matrix.goos == 'linux'
+        shell: bash
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+          ASSET_ARCH: ${{ steps.meta.outputs.asset_arch }}
+        run: |
+          set -euo pipefail
+          bin="dist/eris_${VERSION}_linux_${ASSET_ARCH}"
+          chmod +x "${bin}"
+          tar -C dist -czf "dist/eris_${VERSION}_linux_${ASSET_ARCH}.tar.gz" "$(basename "${bin}")"
 
       - name: Build Debian package
         if: matrix.goos == 'linux'
@@ -133,53 +162,53 @@ jobs:
 
           install -m 0644 "${rendered_control}" "${pkgroot}/DEBIAN/control"
 
-          cat > "${pkgroot}/usr/share/doc/${PKG_NAME}/changelog.Debian" <<EOF
-          ${PKG_NAME} (${VERSION}) unstable; urgency=medium
-
-            * Automated release build.
-
-           -- ${PKG_MAINTAINER}  $(date -R)
-          EOF
+          {
+            printf '%s\n' "${PKG_NAME} (${VERSION}) unstable; urgency=medium"
+            printf '\n'
+            printf '%s\n' "  * Automated release build."
+            printf '\n'
+            printf '%s\n' " -- ${PKG_MAINTAINER}  $(date -R)"
+          } > "${pkgroot}/usr/share/doc/${PKG_NAME}/changelog.Debian"
           gzip -n -9 "${pkgroot}/usr/share/doc/${PKG_NAME}/changelog.Debian"
 
           if [ -f LICENSE ]; then
             install -m 0644 LICENSE "${pkgroot}/usr/share/doc/${PKG_NAME}/copyright"
           else
-            cat > "${pkgroot}/usr/share/doc/${PKG_NAME}/copyright" <<EOF
-            MIT License
-
-            Copyright (c) 2026 Nicolas Altmann
-
-            Permission is hereby granted, free of charge, to any person obtaining a copy
-            of this software and associated documentation files (the "Software"), to deal
-            in the Software without restriction, including without limitation the rights
-            to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-            copies of the Software, and to permit persons to whom the Software is
-            furnished to do so, subject to the following conditions:
-
-            The above copyright notice and this permission notice shall be included in all
-            copies or substantial portions of the Software.
-
-            THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-            IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-            FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-            AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-            LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-            OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
-            SOFTWARE.
-            EOF
+            {
+              printf '%s\n' 'MIT License'
+              printf '\n'
+              printf '%s\n' 'Copyright (c) 2026 Nicolas Altmann'
+              printf '\n'
+              printf '%s\n' 'Permission is hereby granted, free of charge, to any person obtaining a copy'
+              printf '%s\n' 'of this software and associated documentation files (the "Software"), to deal'
+              printf '%s\n' 'in the Software without restriction, including without limitation the rights'
+              printf '%s\n' 'to use, copy, modify, merge, publish, distribute, sublicense, and/or sell'
+              printf '%s\n' 'copies of the Software, and to permit persons to whom the Software is'
+              printf '%s\n' 'furnished to do so, subject to the following conditions:'
+              printf '\n'
+              printf '%s\n' 'The above copyright notice and this permission notice shall be included in all'
+              printf '%s\n' 'copies or substantial portions of the Software.'
+              printf '\n'
+              printf '%s\n' 'THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR'
+              printf '%s\n' 'IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,'
+              printf '%s\n' 'FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE'
+              printf '%s\n' 'AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER'
+              printf '%s\n' 'LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,'
+              printf '%s\n' 'OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE'
+              printf '%s\n' 'SOFTWARE.'
+            } > "${pkgroot}/usr/share/doc/${PKG_NAME}/copyright"
           fi
 
-          cat > "${pkgroot}/usr/share/doc/${PKG_NAME}/upstream" <<EOF
-          Format: https://www.debian.org/doc/packaging-manuals/copyright-format/1.0/
-          Upstream-Name: ${PKG_NAME}
-          Source: ${PKG_HOMEPAGE}
-
-          Files: *
-          Copyright: 2026 Eris contributors
-          License: MIT
-           See /usr/share/doc/${PKG_NAME}/copyright for full MIT license text.
-          EOF
+          {
+            printf '%s\n' 'Format: https://www.debian.org/doc/packaging-manuals/copyright-format/1.0/'
+            printf '%s\n' "Upstream-Name: ${PKG_NAME}"
+            printf '%s\n' "Source: ${PKG_HOMEPAGE}"
+            printf '\n'
+            printf '%s\n' 'Files: *'
+            printf '%s\n' 'Copyright: 2026 Eris contributors'
+            printf '%s\n' 'License: MIT'
+            printf '%s\n' " See /usr/share/doc/${PKG_NAME}/copyright for full MIT license text."
+          } > "${pkgroot}/usr/share/doc/${PKG_NAME}/upstream"
 
           dpkg-deb --build --root-owner-group "${pkgroot}" "dist/${PKG_NAME}_${VERSION}_linux_${ASSET_ARCH}.deb"
           lintian "dist/${PKG_NAME}_${VERSION}_linux_${ASSET_ARCH}.deb"
