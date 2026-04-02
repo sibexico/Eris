@@ -176,8 +176,22 @@ type uiState struct {
 	decryptKeyManual       fyne.CanvasObject
 	verifyKeyManual        fyne.CanvasObject
 
-	signOnlyCheck   *widget.Check
-	verifyOnlyCheck *widget.Check
+	encryptModeSignOnly   bool
+	decryptModeVerifyOnly bool
+	encryptModeLabel      *widget.Label
+	decryptModeLabel      *widget.Label
+	encryptModeToggleBtn  *widget.Button
+	decryptModeToggleBtn  *widget.Button
+	encryptActionBtn      *widget.Button
+	decryptActionBtn      *widget.Button
+	encryptInputLabel     *widget.Label
+	encryptOutputLabel    *widget.Label
+	decryptInputLabel     *widget.Label
+	decryptOutputLabel    *widget.Label
+	encryptModeSep        *widget.Separator
+	encryptRecipientSep   *widget.Separator
+	decryptInputSep       *widget.Separator
+	decryptKeySep         *widget.Separator
 
 	statusLabel *widget.Label
 }
@@ -281,13 +295,6 @@ func newUIState(a fyne.App, w fyne.Window) *uiState {
 	s.plainOutputEntry = widget.NewMultiLineEntry()
 	s.plainOutputEntry.Disable()
 	s.plainOutputEntry.SetMinRowsVisible(5)
-
-	s.signOnlyCheck = widget.NewCheck("Sign only (no encryption)", func(_ bool) {
-		s.refreshEncryptActionMode()
-	})
-	s.verifyOnlyCheck = widget.NewCheck("Verify only (signed message, no decryption)", func(_ bool) {
-		s.refreshDecryptActionMode()
-	})
 
 	s.statusLabel = widget.NewLabel("Ready")
 
@@ -499,37 +506,58 @@ func (s *uiState) buildMyKeysTab() fyne.CanvasObject {
 }
 
 func (s *uiState) buildEncryptTab() fyne.CanvasObject {
-	encryptBtn := widget.NewButton("Encrypt message", s.encryptMessage)
+	s.encryptActionBtn = widget.NewButton("Encrypt message", s.encryptMessage)
+	s.encryptModeLabel = widget.NewLabel("")
+	s.encryptModeToggleBtn = widget.NewButton("", func() {
+		s.encryptModeSignOnly = !s.encryptModeSignOnly
+		s.refreshEncryptActionMode()
+	})
+	s.encryptInputLabel = widget.NewLabel("Message to encrypt")
+	s.encryptOutputLabel = widget.NewLabel("Encrypted output")
+	s.encryptModeSep = widget.NewSeparator()
+	s.encryptRecipientSep = widget.NewSeparator()
+
 	copyBtn := widget.NewButton("Copy encrypted message", func() {
 		if strings.TrimSpace(s.cipherEntry.Text) == "" {
 			s.setStatus("Nothing to copy")
 			return
 		}
 		s.app.Clipboard().SetContent(s.cipherEntry.Text)
-		s.setStatus("Encrypted message copied")
+		s.setStatus("Output copied")
 	})
 
 	content := container.NewVBox(
-		s.centerBlock(widget.NewCard("Encrypt and sign", "Use normal encrypt+sign, or choose sign-only mode.", container.NewVBox(
-			s.signOnlyCheck,
-			widget.NewSeparator(),
+		s.centerBlock(widget.NewCard("Encrypt and sign", "Use the mode switch button to move between encrypt and sign workflows.", container.NewVBox(
+			container.NewHBox(s.encryptModeLabel, layout.NewSpacer(), s.encryptModeToggleBtn),
+			s.encryptModeSep,
 			s.encryptRecipientBox,
-			widget.NewSeparator(),
+			s.encryptRecipientSep,
 			s.encryptSignerBox,
 			widget.NewSeparator(),
-			widget.NewLabel("Message to encrypt"),
+			s.encryptInputLabel,
 			s.multilineField(s.plainEntry),
-			encryptBtn,
-			widget.NewLabel("Encrypted output"),
+			s.encryptActionBtn,
+			s.encryptOutputLabel,
 			s.multilineField(s.cipherEntry),
 			copyBtn,
 		))),
 	)
+	s.refreshEncryptActionMode()
 	return container.NewVScroll(content)
 }
 
 func (s *uiState) buildDecryptTab() fyne.CanvasObject {
-	decryptBtn := widget.NewButton("Decrypt message", s.decryptMessage)
+	s.decryptActionBtn = widget.NewButton("Decrypt message", s.decryptMessage)
+	s.decryptModeLabel = widget.NewLabel("")
+	s.decryptModeToggleBtn = widget.NewButton("", func() {
+		s.decryptModeVerifyOnly = !s.decryptModeVerifyOnly
+		s.refreshDecryptActionMode()
+	})
+	s.decryptInputLabel = widget.NewLabel("Encrypted message")
+	s.decryptOutputLabel = widget.NewLabel("Plain output")
+	s.decryptInputSep = widget.NewSeparator()
+	s.decryptKeySep = widget.NewSeparator()
+
 	copyBtn := widget.NewButton("Copy plain message", func() {
 		if strings.TrimSpace(s.plainOutputEntry.Text) == "" {
 			s.setStatus("Nothing to copy")
@@ -540,21 +568,22 @@ func (s *uiState) buildDecryptTab() fyne.CanvasObject {
 	})
 
 	content := container.NewVBox(
-		s.centerBlock(widget.NewCard("Decrypt and verify", "Use decrypt+verify, or choose verify-only mode.", container.NewVBox(
-			s.verifyOnlyCheck,
+		s.centerBlock(widget.NewCard("Decrypt and verify", "Use the mode switch button to move between decrypt and verify workflows.", container.NewVBox(
+			container.NewHBox(s.decryptModeLabel, layout.NewSpacer(), s.decryptModeToggleBtn),
 			widget.NewSeparator(),
-			widget.NewLabel("Encrypted message"),
+			s.decryptInputLabel,
 			s.multilineField(s.cipherInputEntry),
-			widget.NewSeparator(),
+			s.decryptInputSep,
 			s.decryptKeyBox,
-			widget.NewSeparator(),
+			s.decryptKeySep,
 			s.verifyKeyBox,
-			decryptBtn,
-			widget.NewLabel("Plain output"),
+			s.decryptActionBtn,
+			s.decryptOutputLabel,
 			s.multilineField(s.plainOutputEntry),
 			copyBtn,
 		))),
 	)
+	s.refreshDecryptActionMode()
 	return container.NewVScroll(content)
 }
 
@@ -602,22 +631,81 @@ func (s *uiState) refreshEncryptManualVisibility() {
 	if s.encryptSignerBox != nil {
 		s.encryptSignerBox.Refresh()
 	}
-	if c := s.win.Content(); c != nil {
-		c.Refresh()
-	}
 }
 
 func (s *uiState) refreshEncryptActionMode() {
-	if s.signOnlyCheck != nil && s.encryptRecipientBox != nil {
-		if s.signOnlyCheck.Checked {
+	if s.encryptRecipientBox != nil {
+		if s.encryptModeSignOnly {
 			s.encryptRecipientBox.Hide()
 		} else {
 			s.encryptRecipientBox.Show()
 		}
 		s.encryptRecipientBox.Refresh()
 	}
-	if c := s.win.Content(); c != nil {
-		c.Refresh()
+	if s.encryptModeSep != nil {
+		if s.encryptModeSignOnly {
+			s.encryptModeSep.Hide()
+		} else {
+			s.encryptModeSep.Show()
+		}
+		s.encryptModeSep.Refresh()
+	}
+	if s.encryptRecipientSep != nil {
+		s.encryptRecipientSep.Show()
+		s.encryptRecipientSep.Refresh()
+	}
+	if s.encryptModeLabel != nil {
+		if s.encryptModeSignOnly {
+			s.encryptModeLabel.SetText("Mode: Sign")
+		} else {
+			s.encryptModeLabel.SetText("Mode: Encrypt")
+		}
+	}
+	if s.encryptModeToggleBtn != nil {
+		if s.encryptModeSignOnly {
+			s.encryptModeToggleBtn.SetText("Switch to encrypt mode")
+		} else {
+			s.encryptModeToggleBtn.SetText("Switch to sign mode")
+		}
+	}
+	if s.encryptActionBtn != nil {
+		if s.encryptModeSignOnly {
+			s.encryptActionBtn.SetText("Sign message")
+		} else {
+			s.encryptActionBtn.SetText("Encrypt message")
+		}
+	}
+	if s.encryptInputLabel != nil {
+		if s.encryptModeSignOnly {
+			s.encryptInputLabel.SetText("Message to sign")
+		} else {
+			s.encryptInputLabel.SetText("Message to encrypt")
+		}
+	}
+	if s.encryptOutputLabel != nil {
+		if s.encryptModeSignOnly {
+			s.encryptOutputLabel.SetText("Signed output")
+		} else {
+			s.encryptOutputLabel.SetText("Encrypted output")
+		}
+	}
+	if s.encryptModeLabel != nil {
+		s.encryptModeLabel.Refresh()
+	}
+	if s.encryptModeToggleBtn != nil {
+		s.encryptModeToggleBtn.Refresh()
+	}
+	if s.encryptActionBtn != nil {
+		s.encryptActionBtn.Refresh()
+	}
+	if s.encryptInputLabel != nil {
+		s.encryptInputLabel.Refresh()
+	}
+	if s.encryptOutputLabel != nil {
+		s.encryptOutputLabel.Refresh()
+	}
+	if s.encryptSignerBox != nil {
+		s.encryptSignerBox.Refresh()
 	}
 }
 
@@ -645,22 +733,86 @@ func (s *uiState) refreshDecryptManualVisibility() {
 	if s.verifyKeyBox != nil {
 		s.verifyKeyBox.Refresh()
 	}
-	if c := s.win.Content(); c != nil {
-		c.Refresh()
-	}
 }
 
 func (s *uiState) refreshDecryptActionMode() {
-	if s.verifyOnlyCheck != nil && s.decryptKeyBox != nil {
-		if s.verifyOnlyCheck.Checked {
+	if s.decryptKeyBox != nil {
+		if s.decryptModeVerifyOnly {
 			s.decryptKeyBox.Hide()
 		} else {
 			s.decryptKeyBox.Show()
 		}
 		s.decryptKeyBox.Refresh()
 	}
-	if c := s.win.Content(); c != nil {
-		c.Refresh()
+	if s.decryptInputSep != nil {
+		if s.decryptModeVerifyOnly {
+			s.decryptInputSep.Hide()
+		} else {
+			s.decryptInputSep.Show()
+		}
+		s.decryptInputSep.Refresh()
+	}
+	if s.decryptKeySep != nil {
+		s.decryptKeySep.Show()
+		s.decryptKeySep.Refresh()
+	}
+	if s.decryptModeLabel != nil {
+		if s.decryptModeVerifyOnly {
+			s.decryptModeLabel.SetText("Mode: Verify")
+		} else {
+			s.decryptModeLabel.SetText("Mode: Decrypt")
+		}
+	}
+	if s.decryptModeToggleBtn != nil {
+		if s.decryptModeVerifyOnly {
+			s.decryptModeToggleBtn.SetText("Switch to decrypt mode")
+		} else {
+			s.decryptModeToggleBtn.SetText("Switch to verify mode")
+		}
+	}
+	if s.decryptActionBtn != nil {
+		if s.decryptModeVerifyOnly {
+			s.decryptActionBtn.SetText("Verify message")
+		} else {
+			s.decryptActionBtn.SetText("Decrypt message")
+		}
+	}
+	if s.decryptInputLabel != nil {
+		if s.decryptModeVerifyOnly {
+			s.decryptInputLabel.SetText("Signed message")
+			s.cipherInputEntry.SetPlaceHolder("Signed cleartext message")
+		} else {
+			s.decryptInputLabel.SetText("Encrypted message")
+			s.cipherInputEntry.SetPlaceHolder("Encrypted message")
+		}
+	}
+	if s.decryptOutputLabel != nil {
+		if s.decryptModeVerifyOnly {
+			s.decryptOutputLabel.SetText("Verified output")
+		} else {
+			s.decryptOutputLabel.SetText("Plain output")
+		}
+	}
+	if s.decryptModeLabel != nil {
+		s.decryptModeLabel.Refresh()
+	}
+	if s.decryptModeToggleBtn != nil {
+		s.decryptModeToggleBtn.Refresh()
+	}
+	if s.decryptActionBtn != nil {
+		s.decryptActionBtn.Refresh()
+	}
+	if s.decryptInputLabel != nil {
+		s.decryptInputLabel.Refresh()
+	}
+	if s.decryptOutputLabel != nil {
+		s.decryptOutputLabel.Refresh()
+	}
+	if s.verifyKeyBox != nil {
+		s.verifyKeyBox.Refresh()
+	}
+	if s.cipherInputEntry != nil {
+		s.cipherInputEntry.Refresh()
 	}
 }
 
@@ -858,7 +1010,7 @@ func (s *uiState) addThirdPartyKey() {
 
 func (s *uiState) encryptMessage() {
 	signerPriv := ""
-	if s.signOnlyCheck != nil && s.signOnlyCheck.Checked {
+	if s.encryptModeSignOnly {
 		if s.encryptSignerSelect.Selected == "Enter the key" {
 			signerPriv = strings.TrimSpace(s.encryptSignerEntry.Text)
 		} else {
@@ -932,7 +1084,7 @@ func (s *uiState) decryptMessage() {
 		}
 	}
 
-	if s.verifyOnlyCheck != nil && s.verifyOnlyCheck.Checked {
+	if s.decryptModeVerifyOnly {
 		if pub == "" {
 			s.setStatus("Please choose sender public key or enter one manually")
 			return

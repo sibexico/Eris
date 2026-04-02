@@ -1,6 +1,7 @@
 ![Windows](https://img.shields.io/badge/Windows-Supported-blue?labelColor=gray&logo=data:image/svg%2Bxml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHZpZXdCb3g9IjAgMCAyNCAyNCI%2BPHBhdGggZmlsbD0iI0ZGRiIgZD0iTTAgMGgxMXYxMUgwek0xMyAwaDExdjExSDEzek0wIDEzaDExdjExSDB6TTEzIDEzaDExdjExSDEzeiIvPjwvc3ZnPg%3D%3D)
  ![Linux](https://img.shields.io/badge/Linux-Supported-yellow?labelColor=gray&logo=linux)
 
+[![Product Hunt](https://api.producthunt.com/widgets/embed-image/v1/featured.svg?post_id=1113038&amp;theme=dark&amp;t=1775035098003)](https://www.producthunt.com/products/eris)
 
 ![Go Version](https://img.shields.io/badge/Go-1.26.1-blue?labelColor=gray&logo=go)
  [![Go Report Card](https://goreportcard.com/badge/github.com/sibexico/Eris)](https://goreportcard.com/report/github.com/sibexico/Eris)
