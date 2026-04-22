@@ -8,6 +8,103 @@ permissions:
   contents: write
 
 jobs:
+  test-and-update-badges:
+    if: startsWith(github.event.release.tag_name, 'v')
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout default branch
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Run tests with coverage
+        id: tests
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -euo pipefail
+          go test ./... -coverprofile=coverage.out -covermode=atomic
+
+      - name: Build badges and update README
+        id: badges
+        shell: bash
+        env:
+          RUN_URL: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+
+          if [[ "${{ steps.tests.outcome }}" == "success" ]]; then
+            test_status="Passed"
+            test_color="green"
+          else
+            test_status="Failed"
+            test_color="red"
+          fi
+
+          coverage="0.0"
+          if [[ -f coverage.out ]]; then
+            coverage="$(go tool cover -func=coverage.out | awk '/^total:/ {print $3}' | tr -d '%')"
+          fi
+
+          coverage="$(awk -v c="$coverage" 'BEGIN {printf "%.1f", c + 0}')"
+
+          if awk -v c="$coverage" 'BEGIN {exit !(c >= 70)}'; then
+            coverage_color="green"
+          elif awk -v c="$coverage" 'BEGIN {exit !(c >= 50)}'; then
+            coverage_color="yellow"
+          else
+            coverage_color="red"
+          fi
+
+          coverage_label="${coverage}%25"
+          test_badge="https://img.shields.io/badge/Tests-${test_status}-${test_color}?labelColor=gray&logo=github"
+          coverage_badge="https://img.shields.io/badge/Tests%20Coverage-${coverage_label}-${coverage_color}?labelColor=gray&logo=gitextensions"
+
+          test_line="[![Tests passed](${test_badge})](${RUN_URL})"
+          coverage_line=" [![Tests coverage](${coverage_badge})](${RUN_URL})"
+
+          awk -v test_line="$test_line" -v coverage_line="$coverage_line" '
+            {
+              if ($0 ~ /\[Tests passed\]/) {
+                print test_line
+                next
+              }
+              if ($0 ~ /\[Tests coverage\]/) {
+                print coverage_line
+                next
+              }
+              print
+            }
+          ' README.md > README.tmp && mv README.tmp README.md
+
+      - name: Commit README badge updates
+        shell: bash
+        run: |
+          set -euo pipefail
+          if git diff --quiet -- README.md; then
+            echo "README.md already up to date"
+            exit 0
+          fi
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add README.md
+          git commit -m "docs: update release test and coverage badges"
+          git push
+
+      - name: Fail job when tests failed
+        if: steps.tests.outcome != 'success'
+        shell: bash
+        run: |
+          echo "Tests failed. Badges were updated to reflect the failed run."
+          exit 1
+
   build:
     strategy:
       fail-fast: false

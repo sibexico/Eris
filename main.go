@@ -41,6 +41,9 @@ var errBadFormat = errors.New("invalid vault format")
 //go:embed icon.png
 var iconPNG []byte
 
+//go:embed VERSION
+var appVersion string
+
 var appIcon = fyne.NewStaticResource("icon.png", iconPNG)
 
 type keyType string
@@ -197,6 +200,10 @@ type uiState struct {
 }
 
 func main() {
+	if handleCLIArgs(os.Args) {
+		return
+	}
+
 	hardeningWarning := ""
 	if err := hardenProcess(); err != nil {
 		hardeningWarning = "Process hardening warning: " + err.Error()
@@ -216,6 +223,26 @@ func main() {
 	s.showStartup()
 
 	w.ShowAndRun()
+}
+
+func handleCLIArgs(args []string) bool {
+	if len(args) < 2 {
+		return false
+	}
+
+	switch args[1] {
+	case "--version", "-version", "version", "-v":
+		fmt.Println(strings.TrimSpace(appVersion))
+		return true
+	case "--help", "-h", "help":
+		fmt.Println("Eris PGP Workstation")
+		fmt.Println("Usage:")
+		fmt.Println("  eris --version   Print app version")
+		fmt.Println("  eris --help      Show this help")
+		return true
+	default:
+		return false
+	}
 }
 
 func newUIState(a fyne.App, w fyne.Window) *uiState {
