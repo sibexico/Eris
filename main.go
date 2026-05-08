@@ -5,6 +5,7 @@ import (
 	"crypto/aes"
 	"crypto/cipher"
 	"crypto/rand"
+	"crypto/subtle"
 	_ "embed"
 	"encoding/base64"
 	"encoding/csv"
@@ -466,10 +467,27 @@ func (s *uiState) showMainUI() {
 	keysTab := container.NewTabItem("Keys", s.buildKeysTab())
 	encryptTab := container.NewTabItem("Encrypt & Sign", s.buildEncryptTab())
 	decryptTab := container.NewTabItem("Decrypt & Verify", s.buildDecryptTab())
+	settingsTab := container.NewTabItem("Settings", s.buildSettingsTab())
 
-	tabs := container.NewAppTabs(myKeysTab, keysTab, encryptTab, decryptTab)
+	tabs := container.NewAppTabs(myKeysTab, keysTab, encryptTab, decryptTab, settingsTab)
 	s.win.SetContent(s.wrapWithStatus(tabs))
 	s.win.Canvas().Focus(s.aliasEntry)
+}
+
+func (s *uiState) buildSettingsTab() fyne.CanvasObject {
+	content := container.NewVBox(
+		s.centerBlock(widget.NewCard("Vault settings", "Switch vault file or rotate the vault passphrase.", container.NewVBox(
+			container.NewHBox(
+				widget.NewButton("Change vault", s.changeVault),
+				layout.NewSpacer(),
+			),
+			container.NewHBox(
+				widget.NewButton("Change passphrase", s.promptChangePassphrase),
+				layout.NewSpacer(),
+			),
+		))),
+	)
+	return container.NewVScroll(content)
 }
 
 func (s *uiState) buildKeysTab() fyne.CanvasObject {
@@ -982,6 +1000,92 @@ func (s *uiState) saveVaultNow() {
 	if err := saveVault(s.vaultPath, s.passphrase, s.entries); err != nil {
 		s.setStatus("Auto-save failed: " + err.Error())
 	}
+}
+
+func (s *uiState) changeVault() {
+	s.showStartup()
+	if s.vaultPath != "" {
+		s.vaultPathEntry.SetText(s.vaultPath)
+	}
+	s.passphraseEntry.SetText("")
+	s.setStatus("Pick the new vault and open it")
+}
+
+func (s *uiState) promptChangePassphrase() {
+	if s.vaultPath == "" || len(s.passphrase) == 0 {
+		s.setStatus("Open a vault before changing passphrase")
+		return
+	}
+
+	oldPassEntry := widget.NewPasswordEntry()
+	oldPassEntry.SetPlaceHolder("Current passphrase")
+
+	newPassEntry := widget.NewPasswordEntry()
+	newPassEntry.SetPlaceHolder("New passphrase")
+
+	newPassAgainEntry := widget.NewPasswordEntry()
+	newPassAgainEntry.SetPlaceHolder("Repeat new passphrase")
+
+	var dlg *dialog.FormDialog
+	applyChange := func() bool {
+		oldPass := []byte(sanitizedPassphrase(oldPassEntry.Text))
+		defer zeroBytes(oldPass)
+		if subtle.ConstantTimeCompare(oldPass, s.passphrase) != 1 {
+			s.setStatus("Current passphrase is incorrect")
+			return false
+		}
+
+		newPassphrase := sanitizedPassphrase(newPassEntry.Text)
+		newPassphraseAgain := sanitizedPassphrase(newPassAgainEntry.Text)
+		if len(newPassphrase) < 8 {
+			s.setStatus("Passphrase must be at least 8 characters")
+			return false
+		}
+		if newPassphrase != newPassphraseAgain {
+			s.setStatus("New passphrases do not match")
+			return false
+		}
+
+		newPass := []byte(newPassphrase)
+		if err := saveVault(s.vaultPath, newPass, s.entries); err != nil {
+			s.setStatus("Passphrase update failed: " + err.Error())
+			zeroBytes(newPass)
+			return false
+		}
+
+		if len(s.passphrase) > 0 {
+			zeroBytes(s.passphrase)
+		}
+		s.passphrase = newPass
+		s.setStatus("Vault passphrase changed")
+		return true
+	}
+
+	newPassAgainEntry.OnSubmitted = func(string) {
+		if applyChange() && dlg != nil {
+			dlg.Hide()
+		}
+	}
+
+	dlg = dialog.NewForm(
+		"Change vault passphrase",
+		"Change",
+		"Cancel",
+		[]*widget.FormItem{
+			widget.NewFormItem("Current passphrase", oldPassEntry),
+			widget.NewFormItem("New passphrase", newPassEntry),
+			widget.NewFormItem("Repeat new passphrase", newPassAgainEntry),
+		},
+		func(ok bool) {
+			if !ok {
+				return
+			}
+			applyChange()
+		},
+		s.win,
+	)
+	dlg.Resize(fyne.NewSize(520, 0))
+	dlg.Show()
 }
 
 func (s *uiState) generateOwnerKeyPair() {

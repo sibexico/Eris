@@ -8,6 +8,9 @@ import (
 	"regexp"
 	"strings"
 	"testing"
+
+	"fyne.io/fyne/v2/container"
+	"fyne.io/fyne/v2/widget"
 )
 
 type testURI struct {
@@ -367,5 +370,196 @@ func TestUIStateKeyHelpers(t *testing.T) {
 	signers := s.encryptOptionsSigner()
 	if len(signers) != 2 || signers[1] != "owner1" {
 		t.Fatalf("unexpected signer options: %#v", signers)
+	}
+}
+
+func TestHandleCLIArgs(t *testing.T) {
+	if !handleCLIArgs([]string{"eris", "--version"}) {
+		t.Fatalf("expected --version to be handled")
+	}
+	if !handleCLIArgs([]string{"eris", "--help"}) {
+		t.Fatalf("expected --help to be handled")
+	}
+	if handleCLIArgs([]string{"eris", "unknown"}) {
+		t.Fatalf("did not expect unknown arg to be handled")
+	}
+	if handleCLIArgs([]string{"eris"}) {
+		t.Fatalf("did not expect missing arg to be handled")
+	}
+}
+
+func TestOpenCreateVaultValidationPaths(t *testing.T) {
+	s := &uiState{statusLabel: widget.NewLabel("Ready")}
+
+	s.vaultPathEntry = widget.NewEntry()
+	s.passphraseEntry = widget.NewPasswordEntry()
+	s.openVault()
+	if got := s.statusLabel.Text; got != "Choose a vault file first" {
+		t.Fatalf("unexpected status for empty open path: %q", got)
+	}
+
+	s.vaultPathEntry.SetText("vault.csv.enc")
+	s.passphraseEntry.SetText("short")
+	s.openVault()
+	if got := s.statusLabel.Text; got != "Passphrase must be at least 8 characters" {
+		t.Fatalf("unexpected status for short open passphrase: %q", got)
+	}
+
+	s.createPathEntry = widget.NewEntry()
+	s.createPassEntry = widget.NewPasswordEntry()
+	s.createPassAgainEntry = widget.NewPasswordEntry()
+	s.createVault()
+	if got := s.statusLabel.Text; got != "Choose where to save the vault" {
+		t.Fatalf("unexpected status for empty create path: %q", got)
+	}
+
+	s.createPathEntry.SetText("new.enc")
+	s.createPassEntry.SetText("short")
+	s.createPassAgainEntry.SetText("short")
+	s.createVault()
+	if got := s.statusLabel.Text; got != "Passphrase must be at least 8 characters" {
+		t.Fatalf("unexpected status for short create passphrase: %q", got)
+	}
+
+	s.createPassEntry.SetText("long-enough-pass")
+	s.createPassAgainEntry.SetText("different-pass")
+	s.createVault()
+	if got := s.statusLabel.Text; got != "Passphrases do not match" {
+		t.Fatalf("unexpected status for mismatched create passphrase: %q", got)
+	}
+}
+
+func TestRefreshEncryptVisibilityAndMode(t *testing.T) {
+	s := &uiState{}
+	s.encryptRecipientSelect = widget.NewSelect([]string{"Enter the key", "Alice"}, nil)
+	s.encryptSignerSelect = widget.NewSelect([]string{"Enter the key", "Me"}, nil)
+	s.encryptRecipientEntry = widget.NewMultiLineEntry()
+	s.encryptSignerEntry = widget.NewMultiLineEntry()
+	s.encryptRecipientManual = widget.NewLabel("recipient manual")
+	s.encryptSignerManual = widget.NewLabel("signer manual")
+	s.encryptRecipientBox = container.NewVBox(s.encryptRecipientManual)
+	s.encryptSignerBox = container.NewVBox(s.encryptSignerManual)
+
+	s.encryptRecipientSelect.SetSelected("Enter the key")
+	s.encryptSignerSelect.SetSelected("Me")
+	s.refreshEncryptManualVisibility()
+	if !s.encryptRecipientManual.Visible() {
+		t.Fatalf("recipient manual input should be visible for Enter the key")
+	}
+	if s.encryptSignerManual.Visible() {
+		t.Fatalf("signer manual input should be hidden for saved key")
+	}
+
+	s.encryptModeSep = widget.NewSeparator()
+	s.encryptRecipientSep = widget.NewSeparator()
+	s.encryptModeLabel = widget.NewLabel("")
+	s.encryptModeToggleBtn = widget.NewButton("", nil)
+	s.encryptActionBtn = widget.NewButton("", nil)
+	s.encryptInputLabel = widget.NewLabel("")
+	s.encryptOutputLabel = widget.NewLabel("")
+
+	s.encryptModeSignOnly = false
+	s.refreshEncryptActionMode()
+	if s.encryptModeLabel.Text != "Mode: Encrypt" || s.encryptActionBtn.Text != "Encrypt message" {
+		t.Fatalf("unexpected encrypt mode labels: %q / %q", s.encryptModeLabel.Text, s.encryptActionBtn.Text)
+	}
+	if !s.encryptRecipientBox.Visible() {
+		t.Fatalf("recipient selector should be visible in encrypt mode")
+	}
+
+	s.encryptModeSignOnly = true
+	s.refreshEncryptActionMode()
+	if s.encryptModeLabel.Text != "Mode: Sign" || s.encryptActionBtn.Text != "Sign message" {
+		t.Fatalf("unexpected sign mode labels: %q / %q", s.encryptModeLabel.Text, s.encryptActionBtn.Text)
+	}
+	if s.encryptRecipientBox.Visible() {
+		t.Fatalf("recipient selector should be hidden in sign mode")
+	}
+}
+
+func TestRefreshDecryptVisibilityAndMode(t *testing.T) {
+	s := &uiState{}
+	s.decryptKeySelect = widget.NewSelect([]string{"Enter the key", "Me"}, nil)
+	s.verifyKeySelect = widget.NewSelect([]string{"Enter the key", "Alice"}, nil)
+	s.decryptKeyEntry = widget.NewMultiLineEntry()
+	s.verifyKeyEntry = widget.NewMultiLineEntry()
+	s.decryptKeyManual = widget.NewLabel("decrypt manual")
+	s.verifyKeyManual = widget.NewLabel("verify manual")
+	s.decryptKeyBox = container.NewVBox(s.decryptKeyManual)
+	s.verifyKeyBox = container.NewVBox(s.verifyKeyManual)
+
+	s.decryptKeySelect.SetSelected("Me")
+	s.verifyKeySelect.SetSelected("Enter the key")
+	s.refreshDecryptManualVisibility()
+	if s.decryptKeyManual.Visible() {
+		t.Fatalf("decrypt manual input should be hidden for saved key")
+	}
+	if !s.verifyKeyManual.Visible() {
+		t.Fatalf("verify manual input should be visible for Enter the key")
+	}
+
+	s.decryptModeLabel = widget.NewLabel("")
+	s.decryptModeToggleBtn = widget.NewButton("", nil)
+	s.decryptActionBtn = widget.NewButton("", nil)
+	s.decryptInputLabel = widget.NewLabel("")
+	s.decryptOutputLabel = widget.NewLabel("")
+	s.decryptInputSep = widget.NewSeparator()
+	s.decryptKeySep = widget.NewSeparator()
+	s.cipherInputEntry = widget.NewMultiLineEntry()
+
+	s.decryptModeVerifyOnly = false
+	s.refreshDecryptActionMode()
+	if s.decryptModeLabel.Text != "Mode: Decrypt" || s.decryptActionBtn.Text != "Decrypt message" {
+		t.Fatalf("unexpected decrypt mode labels: %q / %q", s.decryptModeLabel.Text, s.decryptActionBtn.Text)
+	}
+	if !s.decryptKeyBox.Visible() {
+		t.Fatalf("decrypt key selector should be visible in decrypt mode")
+	}
+
+	s.decryptModeVerifyOnly = true
+	s.refreshDecryptActionMode()
+	if s.decryptModeLabel.Text != "Mode: Verify" || s.decryptActionBtn.Text != "Verify message" {
+		t.Fatalf("unexpected verify mode labels: %q / %q", s.decryptModeLabel.Text, s.decryptActionBtn.Text)
+	}
+	if s.decryptKeyBox.Visible() {
+		t.Fatalf("decrypt key selector should be hidden in verify mode")
+	}
+	if got := s.cipherInputEntry.PlaceHolder; got != "Signed cleartext message" {
+		t.Fatalf("unexpected verify placeholder: %q", got)
+	}
+}
+
+func TestRefreshPairDetailsUIWithButtons(t *testing.T) {
+	s := &uiState{pairDetailsBox: container.NewVBox()}
+	showPub := widget.NewButton("Show public key", nil)
+	copyPub := widget.NewButton("Copy", nil)
+	showPriv := widget.NewButton("Show private key", nil)
+	hidePriv := widget.NewButton("Hide private key", nil)
+
+	s.refreshPairDetailsUIWithButtons(showPub, copyPub, showPriv, hidePriv)
+	if len(s.pairDetailsBox.Objects) != 1 {
+		t.Fatalf("expected single helper label when nothing selected")
+	}
+
+	s.pairs = []ownerPair{{Alias: "me", Fingerprint: "fp-me", Public: "PUB", Private: "PRIV"}}
+	s.selectedPairIdx = 0
+	s.pairAlias = widget.NewLabel("")
+	s.pairFingerprint = widget.NewLabel("")
+	s.pairPublic = widget.NewMultiLineEntry()
+	s.pairPrivate = widget.NewMultiLineEntry()
+
+	s.refreshPairDetailsUIWithButtons(showPub, copyPub, showPriv, hidePriv)
+	if s.pairAlias.Text != "Alias: me" {
+		t.Fatalf("unexpected alias label: %q", s.pairAlias.Text)
+	}
+	if s.pairPrivate.Text != "Private key hidden" {
+		t.Fatalf("private key should be hidden by default")
+	}
+
+	s.showPublic = true
+	s.showPrivate = true
+	s.refreshPairDetailsUIWithButtons(showPub, copyPub, showPriv, hidePriv)
+	if s.pairPrivate.Text != "PRIV" {
+		t.Fatalf("expected visible private key content")
 	}
 }
