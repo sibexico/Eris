@@ -6,16 +6,18 @@ import (
 	"crypto/cipher"
 	"crypto/rand"
 	"crypto/subtle"
-	_ "embed"
+	"embed"
 	"encoding/base64"
 	"encoding/csv"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"image/color"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	"fyne.io/fyne/v2"
@@ -47,6 +49,108 @@ var appVersion string
 
 var appIcon = fyne.NewStaticResource("icon.png", iconPNG)
 
+//go:embed lang/*.json
+var langFiles embed.FS
+
+type localizer struct {
+	mu       sync.RWMutex
+	lang     string
+	messages map[string]map[string]string
+}
+
+func newLocalizer() *localizer {
+	l := &localizer{messages: make(map[string]map[string]string), lang: "en"}
+	if entries, err := langFiles.ReadDir("lang"); err == nil {
+		for _, e := range entries {
+			if e.IsDir() || !strings.HasSuffix(e.Name(), ".json") {
+				continue
+			}
+			b, readErr := langFiles.ReadFile("lang/" + e.Name())
+			if readErr != nil {
+				continue
+			}
+			m := make(map[string]string)
+			if unmarshalErr := json.Unmarshal(b, &m); unmarshalErr != nil {
+				continue
+			}
+			code := strings.TrimSuffix(strings.ToLower(e.Name()), ".json")
+			l.messages[code] = m
+		}
+	}
+	for _, candidate := range []string{os.Getenv("LC_ALL"), os.Getenv("LC_MESSAGES"), os.Getenv("LANG")} {
+		if strings.TrimSpace(candidate) == "" {
+			continue
+		}
+		detected := normalizeLanguageCode(candidate)
+		if _, ok := l.messages[detected]; ok {
+			l.lang = detected
+			break
+		}
+	}
+	if _, ok := l.messages[l.lang]; !ok {
+		l.lang = "en"
+	}
+	return l
+}
+
+func normalizeLanguageCode(raw string) string {
+	raw = strings.ToLower(strings.TrimSpace(raw))
+	if raw == "" {
+		return "en"
+	}
+	if i := strings.Index(raw, ":"); i >= 0 {
+		raw = raw[:i]
+	}
+	if i := strings.Index(raw, "."); i >= 0 {
+		raw = raw[:i]
+	}
+	if i := strings.Index(raw, "_"); i >= 0 {
+		raw = raw[:i]
+	}
+	if i := strings.Index(raw, "-"); i >= 0 {
+		raw = raw[:i]
+	}
+	if len(raw) < 2 {
+		return "en"
+	}
+	return raw
+}
+
+func (l *localizer) Language() string {
+	l.mu.RLock()
+	defer l.mu.RUnlock()
+	return l.lang
+}
+
+func (l *localizer) SetLanguage(code string) bool {
+	code = normalizeLanguageCode(code)
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if _, ok := l.messages[code]; !ok {
+		return false
+	}
+	l.lang = code
+	return true
+}
+
+func (l *localizer) T(text string) string {
+	l.mu.RLock()
+	defer l.mu.RUnlock()
+	if langMap, ok := l.messages[l.lang]; ok {
+		if translated, ok := langMap[text]; ok && translated != "" {
+			return translated
+		}
+	}
+	if enMap, ok := l.messages["en"]; ok {
+		if translated, ok := enMap[text]; ok && translated != "" {
+			return translated
+		}
+	}
+	return text
+}
+
+var appLocalizer = newLocalizer()
+
 type keyType string
 
 const (
@@ -69,6 +173,45 @@ type ownerPair struct {
 	Fingerprint string
 	Public      string
 	Private     string
+}
+
+type vaultSettings struct {
+	Language string `json:"language"`
+}
+
+type vaultData struct {
+	Version  int           `json:"version"`
+	Settings vaultSettings `json:"settings"`
+	Entries  []keyEntry    `json:"entries"`
+}
+
+func defaultVaultSettings() vaultSettings {
+	lang := normalizeLanguageCode(appLocalizer.Language())
+	if lang == "" {
+		lang = "en"
+	}
+	if !appLocalizer.SetLanguage(lang) {
+		lang = "en"
+		_ = appLocalizer.SetLanguage(lang)
+	}
+	return vaultSettings{Language: lang}
+}
+
+func normalizeVaultSettings(in vaultSettings) (vaultSettings, bool) {
+	out := in
+	changed := false
+	lang := normalizeLanguageCode(out.Language)
+	if lang == "" {
+		lang = "en"
+		changed = true
+	}
+	if !appLocalizer.SetLanguage(lang) {
+		lang = "en"
+		changed = true
+	}
+	out.Language = lang
+	_ = appLocalizer.SetLanguage(lang)
+	return out, changed
 }
 
 type erisTheme struct{}
@@ -133,6 +276,7 @@ type uiState struct {
 	vaultPath  string
 	passphrase []byte
 	entries    []keyEntry
+	settings   vaultSettings
 
 	vaultPathEntry       *widget.Entry
 	passphraseEntry      *widget.Entry
@@ -198,6 +342,27 @@ type uiState struct {
 	decryptKeySep         *widget.Separator
 
 	statusLabel *widget.Label
+	languageSel *widget.Select
+}
+
+func (s *uiState) tr(text string) string {
+	return appLocalizer.T(text)
+}
+
+func (s *uiState) trf(text string, args ...any) string {
+	return fmt.Sprintf(s.tr(text), args...)
+}
+
+func (s *uiState) localizeSignatureStatus(status string) string {
+	if status == "Signature: OK" {
+		return s.tr("Signature: OK")
+	}
+	const failPrefix = "Signature: FAILED ("
+	if strings.HasPrefix(status, failPrefix) && strings.HasSuffix(status, ")") {
+		reason := strings.TrimSuffix(strings.TrimPrefix(status, failPrefix), ")")
+		return s.trf("Signature: FAILED (%s)", reason)
+	}
+	return s.tr(status)
 }
 
 func main() {
@@ -248,40 +413,41 @@ func handleCLIArgs(args []string) bool {
 
 func newUIState(a fyne.App, w fyne.Window) *uiState {
 	s := &uiState{
-		app: a,
-		win: w,
+		app:      a,
+		win:      w,
+		settings: defaultVaultSettings(),
 	}
 
 	s.vaultPathEntry = widget.NewEntry()
-	s.vaultPathEntry.SetPlaceHolder("Vault file path")
+	s.vaultPathEntry.SetPlaceHolder(s.tr("Vault file path"))
 
 	s.passphraseEntry = widget.NewPasswordEntry()
-	s.passphraseEntry.SetPlaceHolder("Passphrase")
+	s.passphraseEntry.SetPlaceHolder(s.tr("Passphrase"))
 	s.passphraseEntry.OnSubmitted = func(string) { s.openVault() }
 
 	s.createPathEntry = widget.NewEntry()
-	s.createPathEntry.SetPlaceHolder("New vault path")
+	s.createPathEntry.SetPlaceHolder(s.tr("New vault path"))
 
 	s.createPassEntry = widget.NewPasswordEntry()
-	s.createPassEntry.SetPlaceHolder("Passphrase")
+	s.createPassEntry.SetPlaceHolder(s.tr("Passphrase"))
 	s.createPassEntry.OnSubmitted = func(string) { s.createVault() }
 
 	s.createPassAgainEntry = widget.NewPasswordEntry()
-	s.createPassAgainEntry.SetPlaceHolder("Repeat passphrase")
+	s.createPassAgainEntry.SetPlaceHolder(s.tr("Repeat passphrase"))
 	s.createPassAgainEntry.OnSubmitted = func(string) { s.createVault() }
 
 	s.aliasEntry = widget.NewEntry()
-	s.aliasEntry.SetPlaceHolder("Your name")
+	s.aliasEntry.SetPlaceHolder(s.tr("Your name"))
 	s.emailEntry = widget.NewEntry()
 	s.emailEntry.SetPlaceHolder("your@email")
 
 	s.importAliasEntry = widget.NewEntry()
-	s.importAliasEntry.SetPlaceHolder("Contact name")
+	s.importAliasEntry.SetPlaceHolder(s.tr("Contact name"))
 	s.importKeyEntry = widget.NewMultiLineEntry()
 	s.importKeyEntry.SetMinRowsVisible(5)
-	s.importKeyEntry.SetPlaceHolder("Contact public key")
+	s.importKeyEntry.SetPlaceHolder(s.tr("Contact public key"))
 
-	s.pairAlias = widget.NewLabel("No key pair selected")
+	s.pairAlias = widget.NewLabel(s.tr("No key pair selected"))
 	s.pairFingerprint = widget.NewLabel("")
 	s.pairPublic = widget.NewMultiLineEntry()
 	s.pairPublic.Disable()
@@ -290,19 +456,19 @@ func newUIState(a fyne.App, w fyne.Window) *uiState {
 	s.pairPrivate = widget.NewMultiLineEntry()
 	s.pairPrivate.Disable()
 	s.pairPrivate.SetMinRowsVisible(5)
-	s.pairPrivate.SetText("Private key hidden")
+	s.pairPrivate.SetText(s.tr("Private key hidden"))
 
 	s.encryptRecipientEntry = widget.NewMultiLineEntry()
 	s.encryptRecipientEntry.SetMinRowsVisible(5)
-	s.encryptRecipientEntry.SetPlaceHolder("Recipient public key")
+	s.encryptRecipientEntry.SetPlaceHolder(s.tr("Recipient public key"))
 
 	s.encryptSignerEntry = widget.NewMultiLineEntry()
 	s.encryptSignerEntry.SetMinRowsVisible(5)
-	s.encryptSignerEntry.SetPlaceHolder("Your private key")
+	s.encryptSignerEntry.SetPlaceHolder(s.tr("Your private key"))
 
 	s.plainEntry = widget.NewMultiLineEntry()
 	s.plainEntry.SetMinRowsVisible(5)
-	s.plainEntry.SetPlaceHolder("Message to encrypt")
+	s.plainEntry.SetPlaceHolder(s.tr("Message to encrypt"))
 
 	s.cipherEntry = widget.NewMultiLineEntry()
 	s.cipherEntry.Disable()
@@ -310,21 +476,21 @@ func newUIState(a fyne.App, w fyne.Window) *uiState {
 
 	s.cipherInputEntry = widget.NewMultiLineEntry()
 	s.cipherInputEntry.SetMinRowsVisible(5)
-	s.cipherInputEntry.SetPlaceHolder("Encrypted message")
+	s.cipherInputEntry.SetPlaceHolder(s.tr("Encrypted message"))
 
 	s.decryptKeyEntry = widget.NewMultiLineEntry()
 	s.decryptKeyEntry.SetMinRowsVisible(5)
-	s.decryptKeyEntry.SetPlaceHolder("Your private key")
+	s.decryptKeyEntry.SetPlaceHolder(s.tr("Your private key"))
 
 	s.verifyKeyEntry = widget.NewMultiLineEntry()
 	s.verifyKeyEntry.SetMinRowsVisible(5)
-	s.verifyKeyEntry.SetPlaceHolder("Sender public key")
+	s.verifyKeyEntry.SetPlaceHolder(s.tr("Sender public key"))
 
 	s.plainOutputEntry = widget.NewMultiLineEntry()
 	s.plainOutputEntry.Disable()
 	s.plainOutputEntry.SetMinRowsVisible(5)
 
-	s.statusLabel = widget.NewLabel("Ready")
+	s.statusLabel = widget.NewLabel(s.tr("Ready"))
 
 	s.encryptRecipientSelect = widget.NewSelect([]string{"Enter the key"}, func(_ string) { s.refreshEncryptManualVisibility() })
 	s.encryptRecipientSelect.SetSelected("Enter the key")
@@ -343,16 +509,16 @@ func newUIState(a fyne.App, w fyne.Window) *uiState {
 	s.decryptKeyManual = s.multilineField(s.decryptKeyEntry)
 	s.verifyKeyManual = s.multilineField(s.verifyKeyEntry)
 
-	s.encryptRecipientBox = container.NewVBox(widget.NewLabel("Recipient key source"), s.encryptRecipientSelect, s.encryptRecipientManual)
-	s.encryptSignerBox = container.NewVBox(widget.NewLabel("Signer key source"), s.encryptSignerSelect, s.encryptSignerManual)
-	s.decryptKeyBox = container.NewVBox(widget.NewLabel("Decrypt key source"), s.decryptKeySelect, s.decryptKeyManual)
-	s.verifyKeyBox = container.NewVBox(widget.NewLabel("Verify key source"), s.verifyKeySelect, s.verifyKeyManual)
+	s.encryptRecipientBox = container.NewVBox(widget.NewLabel(s.tr("Recipient key source")), s.encryptRecipientSelect, s.encryptRecipientManual)
+	s.encryptSignerBox = container.NewVBox(widget.NewLabel(s.tr("Signer key source")), s.encryptSignerSelect, s.encryptSignerManual)
+	s.decryptKeyBox = container.NewVBox(widget.NewLabel(s.tr("Decrypt key source")), s.decryptKeySelect, s.decryptKeyManual)
+	s.verifyKeyBox = container.NewVBox(widget.NewLabel(s.tr("Verify key source")), s.verifyKeySelect, s.verifyKeyManual)
 
 	s.pairsList = widget.NewList(
 		func() int { return len(s.pairs) },
 		func() fyne.CanvasObject {
 			lbl := widget.NewLabel("template")
-			btn := widget.NewButton("Remove", nil)
+			btn := widget.NewButton(s.tr("Remove"), nil)
 			return container.NewHBox(lbl, layout.NewSpacer(), btn)
 		},
 		func(i widget.ListItemID, o fyne.CanvasObject) {
@@ -364,6 +530,7 @@ func newUIState(a fyne.App, w fyne.Window) *uiState {
 				btn.OnTapped = nil
 				return
 			}
+			btn.SetText(s.tr("Remove"))
 			lbl.SetText(fmt.Sprintf("%s | %s", s.pairs[i].Alias, s.pairs[i].Fingerprint))
 			idx := i
 			btn.OnTapped = func() {
@@ -385,7 +552,7 @@ func newUIState(a fyne.App, w fyne.Window) *uiState {
 		func() int { return len(s.contactEntries()) },
 		func() fyne.CanvasObject {
 			lbl := widget.NewLabel("template")
-			btn := widget.NewButton("Remove", nil)
+			btn := widget.NewButton(s.tr("Remove"), nil)
 			return container.NewHBox(lbl, layout.NewSpacer(), btn)
 		},
 		func(i widget.ListItemID, o fyne.CanvasObject) {
@@ -398,6 +565,7 @@ func newUIState(a fyne.App, w fyne.Window) *uiState {
 				btn.OnTapped = nil
 				return
 			}
+			btn.SetText(s.tr("Remove"))
 			entry := rows[i]
 			lbl.SetText(fmt.Sprintf("%s | %s", entry.Alias, entry.Fingerprint))
 			id := entry.ID
@@ -410,6 +578,7 @@ func newUIState(a fyne.App, w fyne.Window) *uiState {
 	s.refreshKeyDependentViews()
 	s.refreshEncryptActionMode()
 	s.refreshDecryptActionMode()
+	s.applyTranslations()
 	return s
 }
 
@@ -420,54 +589,117 @@ func (s *uiState) setStatus(msg string) {
 	}
 }
 
+func (s *uiState) applyTranslations() {
+	if s.vaultPathEntry != nil {
+		s.vaultPathEntry.SetPlaceHolder(s.tr("Vault file path"))
+	}
+	if s.passphraseEntry != nil {
+		s.passphraseEntry.SetPlaceHolder(s.tr("Passphrase"))
+	}
+	if s.createPathEntry != nil {
+		s.createPathEntry.SetPlaceHolder(s.tr("New vault path"))
+	}
+	if s.createPassEntry != nil {
+		s.createPassEntry.SetPlaceHolder(s.tr("Passphrase"))
+	}
+	if s.createPassAgainEntry != nil {
+		s.createPassAgainEntry.SetPlaceHolder(s.tr("Repeat passphrase"))
+	}
+	if s.aliasEntry != nil {
+		s.aliasEntry.SetPlaceHolder(s.tr("Your name"))
+	}
+	if s.importAliasEntry != nil {
+		s.importAliasEntry.SetPlaceHolder(s.tr("Contact name"))
+	}
+	if s.importKeyEntry != nil {
+		s.importKeyEntry.SetPlaceHolder(s.tr("Contact public key"))
+	}
+	if s.encryptRecipientEntry != nil {
+		s.encryptRecipientEntry.SetPlaceHolder(s.tr("Recipient public key"))
+	}
+	if s.encryptSignerEntry != nil {
+		s.encryptSignerEntry.SetPlaceHolder(s.tr("Your private key"))
+	}
+	if s.plainEntry != nil {
+		s.plainEntry.SetPlaceHolder(s.tr("Message to encrypt"))
+	}
+	if s.decryptKeyEntry != nil {
+		s.decryptKeyEntry.SetPlaceHolder(s.tr("Your private key"))
+	}
+	if s.verifyKeyEntry != nil {
+		s.verifyKeyEntry.SetPlaceHolder(s.tr("Sender public key"))
+	}
+
+	if s.encryptRecipientBox != nil {
+		s.encryptRecipientBox.Objects = []fyne.CanvasObject{widget.NewLabel(s.tr("Recipient key source")), s.encryptRecipientSelect, s.encryptRecipientManual}
+		s.encryptRecipientBox.Refresh()
+	}
+	if s.encryptSignerBox != nil {
+		s.encryptSignerBox.Objects = []fyne.CanvasObject{widget.NewLabel(s.tr("Signer key source")), s.encryptSignerSelect, s.encryptSignerManual}
+		s.encryptSignerBox.Refresh()
+	}
+	if s.decryptKeyBox != nil {
+		s.decryptKeyBox.Objects = []fyne.CanvasObject{widget.NewLabel(s.tr("Decrypt key source")), s.decryptKeySelect, s.decryptKeyManual}
+		s.decryptKeyBox.Refresh()
+	}
+	if s.verifyKeyBox != nil {
+		s.verifyKeyBox.Objects = []fyne.CanvasObject{widget.NewLabel(s.tr("Verify key source")), s.verifyKeySelect, s.verifyKeyManual}
+		s.verifyKeyBox.Refresh()
+	}
+
+	s.refreshEncryptActionMode()
+	s.refreshDecryptActionMode()
+	s.refreshPairDetailsUI()
+}
+
 func (s *uiState) wrapWithStatus(content fyne.CanvasObject) fyne.CanvasObject {
 	statusBar := container.NewHBox(
-		widget.NewLabel("Status:"),
+		widget.NewLabel(s.tr("Status:")),
 		s.statusLabel,
 	)
 	return container.NewBorder(nil, container.NewPadded(statusBar), nil, nil, content)
 }
 
 func (s *uiState) showStartup() {
-	openCard := widget.NewCard("Open your vault", "Pick your file and unlock with passphrase.", container.NewVBox(
-		widget.NewLabel("Vault file"),
+	openCard := widget.NewCard(s.tr("Open your vault"), s.tr("Pick your file and unlock with passphrase."), container.NewVBox(
+		widget.NewLabel(s.tr("Vault file")),
 		s.vaultPathEntry,
 		container.NewHBox(
-			widget.NewButton("Select vault file...", func() { s.pickOpenVaultPath(s.vaultPathEntry) }),
+			widget.NewButton(s.tr("Select vault file..."), func() { s.pickOpenVaultPath(s.vaultPathEntry) }),
 			layout.NewSpacer(),
 		),
-		widget.NewLabel("Passphrase"),
+		widget.NewLabel(s.tr("Passphrase")),
 		s.passphraseEntry,
-		widget.NewButton("Open vault", s.openVault),
+		widget.NewButton(s.tr("Open vault"), s.openVault),
 	))
 
-	createCard := widget.NewCard("Create a new vault", "Set a save path and passphrase.", container.NewVBox(
-		widget.NewLabel("New vault path"),
+	createCard := widget.NewCard(s.tr("Create a new vault"), s.tr("Set a save path and passphrase."), container.NewVBox(
+		widget.NewLabel(s.tr("New vault path")),
 		s.createPathEntry,
 		container.NewHBox(
-			widget.NewButton("Choose save location...", func() { s.pickSaveVaultPath(s.createPathEntry) }),
+			widget.NewButton(s.tr("Choose save location..."), func() { s.pickSaveVaultPath(s.createPathEntry) }),
 			layout.NewSpacer(),
 		),
-		widget.NewLabel("Passphrase"),
+		widget.NewLabel(s.tr("Passphrase")),
 		s.createPassEntry,
-		widget.NewLabel("Repeat passphrase"),
+		widget.NewLabel(s.tr("Repeat passphrase")),
 		s.createPassAgainEntry,
-		widget.NewButton("Create vault", s.createVault),
+		widget.NewButton(s.tr("Create vault"), s.createVault),
 	))
 
 	tabs := container.NewAppTabs(
-		container.NewTabItem("Open vault", container.NewVScroll(s.centerBlock(openCard))),
-		container.NewTabItem("Create vault", container.NewVScroll(s.centerBlock(createCard))),
+		container.NewTabItem(s.tr("Open vault"), container.NewVScroll(s.centerBlock(openCard))),
+		container.NewTabItem(s.tr("Create vault"), container.NewVScroll(s.centerBlock(createCard))),
 	)
 	s.win.SetContent(s.wrapWithStatus(tabs))
 }
 
 func (s *uiState) showMainUI() {
-	myKeysTab := container.NewTabItem("My Keys", s.buildMyKeysTab())
-	keysTab := container.NewTabItem("Keys", s.buildKeysTab())
-	encryptTab := container.NewTabItem("Encrypt & Sign", s.buildEncryptTab())
-	decryptTab := container.NewTabItem("Decrypt & Verify", s.buildDecryptTab())
-	settingsTab := container.NewTabItem("Settings", s.buildSettingsTab())
+	myKeysTab := container.NewTabItem(s.tr("My Keys"), s.buildMyKeysTab())
+	keysTab := container.NewTabItem(s.tr("Keys"), s.buildKeysTab())
+	encryptTab := container.NewTabItem(s.tr("Encrypt & Sign"), s.buildEncryptTab())
+	decryptTab := container.NewTabItem(s.tr("Decrypt & Verify"), s.buildDecryptTab())
+	settingsTab := container.NewTabItem(s.tr("Settings"), s.buildSettingsTab())
 
 	tabs := container.NewAppTabs(myKeysTab, keysTab, encryptTab, decryptTab, settingsTab)
 	s.win.SetContent(s.wrapWithStatus(tabs))
@@ -475,14 +707,40 @@ func (s *uiState) showMainUI() {
 }
 
 func (s *uiState) buildSettingsTab() fyne.CanvasObject {
+	languageLabel := widget.NewLabel(s.tr("Language"))
+	s.languageSel = widget.NewSelect([]string{s.tr("English"), s.tr("Spanish")}, func(selected string) {
+		code := "en"
+		if selected == s.tr("Spanish") {
+			code = "es"
+		}
+		if code == appLocalizer.Language() {
+			return
+		}
+		if appLocalizer.SetLanguage(code) {
+			s.settings.Language = code
+			s.saveVaultNow()
+			s.applyTranslations()
+			s.showMainUI()
+			s.setStatus(s.tr("Language changed"))
+		}
+	})
+	if appLocalizer.Language() == "es" {
+		s.languageSel.SetSelected(s.tr("Spanish"))
+	} else {
+		s.languageSel.SetSelected(s.tr("English"))
+	}
+
 	content := container.NewVBox(
-		s.centerBlock(widget.NewCard("Vault settings", "Switch vault file or rotate the vault passphrase.", container.NewVBox(
+		s.centerBlock(widget.NewCard(s.tr("Vault settings"), s.tr("Switch vault file or rotate the vault passphrase."), container.NewVBox(
+			languageLabel,
+			s.languageSel,
+			widget.NewSeparator(),
 			container.NewHBox(
-				widget.NewButton("Change vault", s.changeVault),
+				widget.NewButton(s.tr("Change vault"), s.changeVault),
 				layout.NewSpacer(),
 			),
 			container.NewHBox(
-				widget.NewButton("Change passphrase", s.promptChangePassphrase),
+				widget.NewButton(s.tr("Change passphrase"), s.promptChangePassphrase),
 				layout.NewSpacer(),
 			),
 		))),
@@ -491,88 +749,88 @@ func (s *uiState) buildSettingsTab() fyne.CanvasObject {
 }
 
 func (s *uiState) buildKeysTab() fyne.CanvasObject {
-	importForm := widget.NewCard("Add contact public key", "Store only third-party public keys here.", container.NewVBox(
-		widget.NewLabel("Contact name"),
+	importForm := widget.NewCard(s.tr("Add contact public key"), s.tr("Store only third-party public keys here."), container.NewVBox(
+		widget.NewLabel(s.tr("Contact name")),
 		s.importAliasEntry,
-		widget.NewLabel("Contact public key"),
+		widget.NewLabel(s.tr("Contact public key")),
 		s.multilineField(s.importKeyEntry),
-		widget.NewButton("Add contact public key", s.addThirdPartyKey),
+		widget.NewButton(s.tr("Add contact public key"), s.addThirdPartyKey),
 	))
 
 	content := container.NewVBox(
 		s.centerBlock(importForm),
-		s.centerBlock(widget.NewCard("Saved contacts", "Select a row and use Remove for deletion.", s.contactsList)),
+		s.centerBlock(widget.NewCard(s.tr("Saved contacts"), s.tr("Select a row and use Remove for deletion."), s.contactsList)),
 	)
 	return container.NewVScroll(content)
 }
 
 func (s *uiState) buildMyKeysTab() fyne.CanvasObject {
-	createForm := widget.NewCard("Create my key pair", "Generate your own private/public key pair.", container.NewVBox(
-		widget.NewLabel("Your name"),
+	createForm := widget.NewCard(s.tr("Create my key pair"), s.tr("Generate your own private/public key pair."), container.NewVBox(
+		widget.NewLabel(s.tr("Your name")),
 		s.aliasEntry,
-		widget.NewLabel("Your email"),
+		widget.NewLabel(s.tr("Your email")),
 		s.emailEntry,
-		widget.NewButton("Generate key pair", s.generateOwnerKeyPair),
+		widget.NewButton(s.tr("Generate key pair"), s.generateOwnerKeyPair),
 	))
 
-	showPublicBtn := widget.NewButton("Show public key", func() {
+	showPublicBtn := widget.NewButton(s.tr("Show public key"), func() {
 		s.showPublic = true
 		s.refreshPairDetailsUI()
 	})
-	copyPublicBtn := widget.NewButton("Copy", func() {
+	copyPublicBtn := widget.NewButton(s.tr("Copy"), func() {
 		if s.selectedPairIdx < 0 || s.selectedPairIdx >= len(s.pairs) {
 			return
 		}
 		s.app.Clipboard().SetContent(s.pairs[s.selectedPairIdx].Public)
-		s.setStatus("Public key copied")
+		s.setStatus(s.tr("Public key copied"))
 	})
 
-	revealBtn := widget.NewButton("Show private key", func() {
+	revealBtn := widget.NewButton(s.tr("Show private key"), func() {
 		s.showPrivate = true
 		s.refreshPairDetailsUI()
 	})
-	hideBtn := widget.NewButton("Hide private key", func() {
+	hideBtn := widget.NewButton(s.tr("Hide private key"), func() {
 		s.showPrivate = false
 		s.refreshPairDetailsUI()
 	})
 
 	s.pairDetailsBox = container.NewVBox(
-		widget.NewLabel("Select a key from the list to view details."),
+		widget.NewLabel(s.tr("Select a key from the list to view details.")),
 	)
-	detailsCard := widget.NewCard("Selected key pair", "Public and private key fields appear only when requested.", s.pairDetailsBox)
+	detailsCard := widget.NewCard(s.tr("Selected key pair"), s.tr("Public and private key fields appear only when requested."), s.pairDetailsBox)
 	s.refreshPairDetailsUIWithButtons(showPublicBtn, copyPublicBtn, revealBtn, hideBtn)
 
 	content := container.NewVBox(
 		s.centerBlock(createForm),
-		s.centerBlock(widget.NewCard("My key pairs", "Select a row and use Remove for deletion.", s.pairsList)),
+		s.centerBlock(widget.NewCard(s.tr("My key pairs"), s.tr("Select a row and use Remove for deletion."), s.pairsList)),
 		s.centerBlock(detailsCard),
 	)
 	return container.NewVScroll(content)
 }
 
 func (s *uiState) buildEncryptTab() fyne.CanvasObject {
-	s.encryptActionBtn = widget.NewButton("Encrypt message", s.encryptMessage)
+	s.encryptActionBtn = widget.NewButton(s.tr("Encrypt message"), s.encryptMessage)
 	s.encryptModeLabel = widget.NewLabel("")
 	s.encryptModeToggleBtn = widget.NewButton("", func() {
 		s.encryptModeSignOnly = !s.encryptModeSignOnly
 		s.refreshEncryptActionMode()
 	})
-	s.encryptInputLabel = widget.NewLabel("Message to encrypt")
-	s.encryptOutputLabel = widget.NewLabel("Encrypted output")
+	s.encryptInputLabel = widget.NewLabel(s.tr("Message to encrypt"))
+	s.encryptOutputLabel = widget.NewLabel(s.tr("Encrypted output"))
 	s.encryptModeSep = widget.NewSeparator()
 	s.encryptRecipientSep = widget.NewSeparator()
 
-	copyBtn := widget.NewButton("Copy encrypted message", func() {
+	copyBtn := widget.NewButton(s.tr("Copy encrypted message"), func() {
 		if strings.TrimSpace(s.cipherEntry.Text) == "" {
-			s.setStatus("Nothing to copy")
+			s.setStatus(s.tr("Nothing to copy"))
 			return
 		}
 		s.app.Clipboard().SetContent(s.cipherEntry.Text)
-		s.setStatus("Output copied")
+		s.setStatus(s.tr("Output copied"))
 	})
 
 	content := container.NewVBox(
-		s.centerBlock(widget.NewCard("Encrypt and sign", "Use the mode switch button to move between encrypt and sign workflows.", container.NewVBox(
+		s.centerBlock(widget.NewCard(s.tr("Encrypt and sign"), s.tr("Use the mode switch button to move between encrypt and sign workflows."), container.NewVBox(
 			container.NewHBox(s.encryptModeLabel, layout.NewSpacer(), s.encryptModeToggleBtn),
 			s.encryptModeSep,
 			s.encryptRecipientBox,
@@ -592,28 +850,28 @@ func (s *uiState) buildEncryptTab() fyne.CanvasObject {
 }
 
 func (s *uiState) buildDecryptTab() fyne.CanvasObject {
-	s.decryptActionBtn = widget.NewButton("Decrypt message", s.decryptMessage)
+	s.decryptActionBtn = widget.NewButton(s.tr("Decrypt message"), s.decryptMessage)
 	s.decryptModeLabel = widget.NewLabel("")
 	s.decryptModeToggleBtn = widget.NewButton("", func() {
 		s.decryptModeVerifyOnly = !s.decryptModeVerifyOnly
 		s.refreshDecryptActionMode()
 	})
-	s.decryptInputLabel = widget.NewLabel("Encrypted message")
-	s.decryptOutputLabel = widget.NewLabel("Plain output")
+	s.decryptInputLabel = widget.NewLabel(s.tr("Encrypted message"))
+	s.decryptOutputLabel = widget.NewLabel(s.tr("Plain output"))
 	s.decryptInputSep = widget.NewSeparator()
 	s.decryptKeySep = widget.NewSeparator()
 
-	copyBtn := widget.NewButton("Copy plain message", func() {
+	copyBtn := widget.NewButton(s.tr("Copy plain message"), func() {
 		if strings.TrimSpace(s.plainOutputEntry.Text) == "" {
-			s.setStatus("Nothing to copy")
+			s.setStatus(s.tr("Nothing to copy"))
 			return
 		}
 		s.app.Clipboard().SetContent(s.plainOutputEntry.Text)
-		s.setStatus("Plain message copied")
+		s.setStatus(s.tr("Plain message copied"))
 	})
 
 	content := container.NewVBox(
-		s.centerBlock(widget.NewCard("Decrypt and verify", "Use the mode switch button to move between decrypt and verify workflows.", container.NewVBox(
+		s.centerBlock(widget.NewCard(s.tr("Decrypt and verify"), s.tr("Use the mode switch button to move between decrypt and verify workflows."), container.NewVBox(
 			container.NewHBox(s.decryptModeLabel, layout.NewSpacer(), s.decryptModeToggleBtn),
 			widget.NewSeparator(),
 			s.decryptInputLabel,
@@ -701,37 +959,37 @@ func (s *uiState) refreshEncryptActionMode() {
 	}
 	if s.encryptModeLabel != nil {
 		if s.encryptModeSignOnly {
-			s.encryptModeLabel.SetText("Mode: Sign")
+			s.encryptModeLabel.SetText(s.tr("Mode: Sign"))
 		} else {
-			s.encryptModeLabel.SetText("Mode: Encrypt")
+			s.encryptModeLabel.SetText(s.tr("Mode: Encrypt"))
 		}
 	}
 	if s.encryptModeToggleBtn != nil {
 		if s.encryptModeSignOnly {
-			s.encryptModeToggleBtn.SetText("Switch to encrypt mode")
+			s.encryptModeToggleBtn.SetText(s.tr("Switch to encrypt mode"))
 		} else {
-			s.encryptModeToggleBtn.SetText("Switch to sign mode")
+			s.encryptModeToggleBtn.SetText(s.tr("Switch to sign mode"))
 		}
 	}
 	if s.encryptActionBtn != nil {
 		if s.encryptModeSignOnly {
-			s.encryptActionBtn.SetText("Sign message")
+			s.encryptActionBtn.SetText(s.tr("Sign message"))
 		} else {
-			s.encryptActionBtn.SetText("Encrypt message")
+			s.encryptActionBtn.SetText(s.tr("Encrypt message"))
 		}
 	}
 	if s.encryptInputLabel != nil {
 		if s.encryptModeSignOnly {
-			s.encryptInputLabel.SetText("Message to sign")
+			s.encryptInputLabel.SetText(s.tr("Message to sign"))
 		} else {
-			s.encryptInputLabel.SetText("Message to encrypt")
+			s.encryptInputLabel.SetText(s.tr("Message to encrypt"))
 		}
 	}
 	if s.encryptOutputLabel != nil {
 		if s.encryptModeSignOnly {
-			s.encryptOutputLabel.SetText("Signed output")
+			s.encryptOutputLabel.SetText(s.tr("Signed output"))
 		} else {
-			s.encryptOutputLabel.SetText("Encrypted output")
+			s.encryptOutputLabel.SetText(s.tr("Encrypted output"))
 		}
 	}
 	if s.encryptModeLabel != nil {
@@ -803,39 +1061,39 @@ func (s *uiState) refreshDecryptActionMode() {
 	}
 	if s.decryptModeLabel != nil {
 		if s.decryptModeVerifyOnly {
-			s.decryptModeLabel.SetText("Mode: Verify")
+			s.decryptModeLabel.SetText(s.tr("Mode: Verify"))
 		} else {
-			s.decryptModeLabel.SetText("Mode: Decrypt")
+			s.decryptModeLabel.SetText(s.tr("Mode: Decrypt"))
 		}
 	}
 	if s.decryptModeToggleBtn != nil {
 		if s.decryptModeVerifyOnly {
-			s.decryptModeToggleBtn.SetText("Switch to decrypt mode")
+			s.decryptModeToggleBtn.SetText(s.tr("Switch to decrypt mode"))
 		} else {
-			s.decryptModeToggleBtn.SetText("Switch to verify mode")
+			s.decryptModeToggleBtn.SetText(s.tr("Switch to verify mode"))
 		}
 	}
 	if s.decryptActionBtn != nil {
 		if s.decryptModeVerifyOnly {
-			s.decryptActionBtn.SetText("Verify message")
+			s.decryptActionBtn.SetText(s.tr("Verify message"))
 		} else {
-			s.decryptActionBtn.SetText("Decrypt message")
+			s.decryptActionBtn.SetText(s.tr("Decrypt message"))
 		}
 	}
 	if s.decryptInputLabel != nil {
 		if s.decryptModeVerifyOnly {
-			s.decryptInputLabel.SetText("Signed message")
-			s.cipherInputEntry.SetPlaceHolder("Signed cleartext message")
+			s.decryptInputLabel.SetText(s.tr("Signed message"))
+			s.cipherInputEntry.SetPlaceHolder(s.tr("Signed cleartext message"))
 		} else {
-			s.decryptInputLabel.SetText("Encrypted message")
-			s.cipherInputEntry.SetPlaceHolder("Encrypted message")
+			s.decryptInputLabel.SetText(s.tr("Encrypted message"))
+			s.cipherInputEntry.SetPlaceHolder(s.tr("Encrypted message"))
 		}
 	}
 	if s.decryptOutputLabel != nil {
 		if s.decryptModeVerifyOnly {
-			s.decryptOutputLabel.SetText("Verified output")
+			s.decryptOutputLabel.SetText(s.tr("Verified output"))
 		} else {
-			s.decryptOutputLabel.SetText("Plain output")
+			s.decryptOutputLabel.SetText(s.tr("Plain output"))
 		}
 	}
 	if s.decryptModeLabel != nil {
@@ -866,22 +1124,22 @@ func (s *uiState) refreshPairDetailsUI() {
 		return
 	}
 	s.refreshPairDetailsUIWithButtons(
-		widget.NewButton("Show public key", func() {
+		widget.NewButton(s.tr("Show public key"), func() {
 			s.showPublic = true
 			s.refreshPairDetailsUI()
 		}),
-		widget.NewButton("Copy", func() {
+		widget.NewButton(s.tr("Copy"), func() {
 			if s.selectedPairIdx < 0 || s.selectedPairIdx >= len(s.pairs) {
 				return
 			}
 			s.app.Clipboard().SetContent(s.pairs[s.selectedPairIdx].Public)
-			s.setStatus("Public key copied")
+			s.setStatus(s.tr("Public key copied"))
 		}),
-		widget.NewButton("Show private key", func() {
+		widget.NewButton(s.tr("Show private key"), func() {
 			s.showPrivate = true
 			s.refreshPairDetailsUI()
 		}),
-		widget.NewButton("Hide private key", func() {
+		widget.NewButton(s.tr("Hide private key"), func() {
 			s.showPrivate = false
 			s.refreshPairDetailsUI()
 		}),
@@ -893,36 +1151,36 @@ func (s *uiState) refreshPairDetailsUIWithButtons(showPublicBtn, copyPublicBtn, 
 		return
 	}
 	if s.selectedPairIdx < 0 || s.selectedPairIdx >= len(s.pairs) {
-		s.pairDetailsBox.Objects = []fyne.CanvasObject{widget.NewLabel("Select a key from the list to view details.")}
+		s.pairDetailsBox.Objects = []fyne.CanvasObject{widget.NewLabel(s.tr("Select a key from the list to view details."))}
 		s.pairDetailsBox.Refresh()
 		return
 	}
 
 	pair := s.pairs[s.selectedPairIdx]
-	s.pairAlias.SetText("Alias: " + pair.Alias)
-	s.pairFingerprint.SetText("Fingerprint: " + pair.Fingerprint)
+	s.pairAlias.SetText(s.tr("Alias: ") + pair.Alias)
+	s.pairFingerprint.SetText(s.tr("Fingerprint: ") + pair.Fingerprint)
 	s.pairPublic.SetText(pair.Public)
 	if s.showPrivate {
 		s.pairPrivate.SetText(pair.Private)
 	} else {
-		s.pairPrivate.SetText("Private key hidden")
+		s.pairPrivate.SetText(s.tr("Private key hidden"))
 	}
 
 	objs := []fyne.CanvasObject{s.pairAlias, s.pairFingerprint}
 	if s.showPublic {
 		objs = append(objs,
-			container.NewHBox(widget.NewLabel("Public key"), showPublicBtn, copyPublicBtn),
+			container.NewHBox(widget.NewLabel(s.tr("Public key")), showPublicBtn, copyPublicBtn),
 			s.multilineField(s.pairPublic),
 		)
 	} else {
-		objs = append(objs, container.NewHBox(widget.NewLabel("Public key"), showPublicBtn))
+		objs = append(objs, container.NewHBox(widget.NewLabel(s.tr("Public key")), showPublicBtn))
 	}
 	objs = append(objs,
 		container.NewHBox(showPrivateBtn, hidePrivateBtn),
 	)
 	if s.showPrivate {
 		objs = append(objs,
-			widget.NewLabel("Private key"),
+			widget.NewLabel(s.tr("Private key")),
 			s.multilineField(s.pairPrivate),
 		)
 	}
@@ -934,62 +1192,76 @@ func (s *uiState) refreshPairDetailsUIWithButtons(showPublicBtn, copyPublicBtn, 
 func (s *uiState) openVault() {
 	path := strings.TrimSpace(s.vaultPathEntry.Text)
 	if path == "" {
-		s.setStatus("Choose a vault file first")
+		s.setStatus(s.tr("Choose a vault file first"))
 		return
 	}
 	pass := []byte(sanitizedPassphrase(s.passphraseEntry.Text))
 	if len(pass) < 8 {
-		s.setStatus("Passphrase must be at least 8 characters")
+		s.setStatus(s.tr("Passphrase must be at least 8 characters"))
 		zeroBytes(pass)
 		return
 	}
-	entries, err := loadVault(path, pass)
+	entries, settings, migrated, err := loadVault(path, pass)
 	if err != nil {
-		s.setStatus("Unlock failed: " + err.Error())
+		s.setStatus(s.trf("Unlock failed: %s", err.Error()))
 		zeroBytes(pass)
 		return
 	}
+	settings, _ = normalizeVaultSettings(settings)
+	_ = appLocalizer.SetLanguage(settings.Language)
+	s.settings = settings
+	s.applyTranslations()
 	s.entries = entries
 	s.vaultPath = path
 	if len(s.passphrase) > 0 {
 		zeroBytes(s.passphrase)
 	}
 	s.passphrase = pass
+	if migrated {
+		if err := saveVault(path, pass, entries, s.settings); err != nil {
+			s.setStatus(s.trf("Auto-save failed: %s", err.Error()))
+			return
+		}
+	}
 	s.refreshKeyDependentViews()
-	s.setStatus("Vault unlocked")
+	s.setStatus(s.tr("Vault unlocked"))
 	s.showMainUI()
 }
 
 func (s *uiState) createVault() {
 	path := strings.TrimSpace(s.createPathEntry.Text)
 	if path == "" {
-		s.setStatus("Choose where to save the vault")
+		s.setStatus(s.tr("Choose where to save the vault"))
 		return
 	}
 	p1 := sanitizedPassphrase(s.createPassEntry.Text)
 	p2 := sanitizedPassphrase(s.createPassAgainEntry.Text)
 	if len(p1) < 8 {
-		s.setStatus("Passphrase must be at least 8 characters")
+		s.setStatus(s.tr("Passphrase must be at least 8 characters"))
 		return
 	}
 	if p1 != p2 {
-		s.setStatus("Passphrases do not match")
+		s.setStatus(s.tr("Passphrases do not match"))
 		return
 	}
 	pass := []byte(p1)
-	if err := saveVault(path, pass, nil); err != nil {
-		s.setStatus("Create failed: " + err.Error())
+	settings := defaultVaultSettings()
+	if err := saveVault(path, pass, nil, settings); err != nil {
+		s.setStatus(s.trf("Create failed: %s", err.Error()))
 		zeroBytes(pass)
 		return
 	}
 	s.entries = nil
+	s.settings = settings
 	s.vaultPath = path
 	if len(s.passphrase) > 0 {
 		zeroBytes(s.passphrase)
 	}
 	s.passphrase = pass
+	_ = appLocalizer.SetLanguage(settings.Language)
+	s.applyTranslations()
 	s.refreshKeyDependentViews()
-	s.setStatus("Created new vault")
+	s.setStatus(s.tr("Created new vault"))
 	s.showMainUI()
 }
 
@@ -997,8 +1269,8 @@ func (s *uiState) saveVaultNow() {
 	if s.vaultPath == "" || len(s.passphrase) == 0 {
 		return
 	}
-	if err := saveVault(s.vaultPath, s.passphrase, s.entries); err != nil {
-		s.setStatus("Auto-save failed: " + err.Error())
+	if err := saveVault(s.vaultPath, s.passphrase, s.entries, s.settings); err != nil {
+		s.setStatus(s.trf("Auto-save failed: %s", err.Error()))
 	}
 }
 
@@ -1008,47 +1280,47 @@ func (s *uiState) changeVault() {
 		s.vaultPathEntry.SetText(s.vaultPath)
 	}
 	s.passphraseEntry.SetText("")
-	s.setStatus("Pick the new vault and open it")
+	s.setStatus(s.tr("Pick the new vault and open it"))
 }
 
 func (s *uiState) promptChangePassphrase() {
 	if s.vaultPath == "" || len(s.passphrase) == 0 {
-		s.setStatus("Open a vault before changing passphrase")
+		s.setStatus(s.tr("Open a vault before changing passphrase"))
 		return
 	}
 
 	oldPassEntry := widget.NewPasswordEntry()
-	oldPassEntry.SetPlaceHolder("Current passphrase")
+	oldPassEntry.SetPlaceHolder(s.tr("Current passphrase"))
 
 	newPassEntry := widget.NewPasswordEntry()
-	newPassEntry.SetPlaceHolder("New passphrase")
+	newPassEntry.SetPlaceHolder(s.tr("New passphrase"))
 
 	newPassAgainEntry := widget.NewPasswordEntry()
-	newPassAgainEntry.SetPlaceHolder("Repeat new passphrase")
+	newPassAgainEntry.SetPlaceHolder(s.tr("Repeat new passphrase"))
 
 	var dlg *dialog.FormDialog
 	applyChange := func() bool {
 		oldPass := []byte(sanitizedPassphrase(oldPassEntry.Text))
 		defer zeroBytes(oldPass)
 		if subtle.ConstantTimeCompare(oldPass, s.passphrase) != 1 {
-			s.setStatus("Current passphrase is incorrect")
+			s.setStatus(s.tr("Current passphrase is incorrect"))
 			return false
 		}
 
 		newPassphrase := sanitizedPassphrase(newPassEntry.Text)
 		newPassphraseAgain := sanitizedPassphrase(newPassAgainEntry.Text)
 		if len(newPassphrase) < 8 {
-			s.setStatus("Passphrase must be at least 8 characters")
+			s.setStatus(s.tr("Passphrase must be at least 8 characters"))
 			return false
 		}
 		if newPassphrase != newPassphraseAgain {
-			s.setStatus("New passphrases do not match")
+			s.setStatus(s.tr("New passphrases do not match"))
 			return false
 		}
 
 		newPass := []byte(newPassphrase)
-		if err := saveVault(s.vaultPath, newPass, s.entries); err != nil {
-			s.setStatus("Passphrase update failed: " + err.Error())
+		if err := saveVault(s.vaultPath, newPass, s.entries, s.settings); err != nil {
+			s.setStatus(s.trf("Passphrase update failed: %s", err.Error()))
 			zeroBytes(newPass)
 			return false
 		}
@@ -1057,7 +1329,7 @@ func (s *uiState) promptChangePassphrase() {
 			zeroBytes(s.passphrase)
 		}
 		s.passphrase = newPass
-		s.setStatus("Vault passphrase changed")
+		s.setStatus(s.tr("Vault passphrase changed"))
 		return true
 	}
 
@@ -1068,13 +1340,13 @@ func (s *uiState) promptChangePassphrase() {
 	}
 
 	dlg = dialog.NewForm(
-		"Change vault passphrase",
-		"Change",
-		"Cancel",
+		s.tr("Change vault passphrase"),
+		s.tr("Change"),
+		s.tr("Cancel"),
 		[]*widget.FormItem{
-			widget.NewFormItem("Current passphrase", oldPassEntry),
-			widget.NewFormItem("New passphrase", newPassEntry),
-			widget.NewFormItem("Repeat new passphrase", newPassAgainEntry),
+			widget.NewFormItem(s.tr("Current passphrase"), oldPassEntry),
+			widget.NewFormItem(s.tr("New passphrase"), newPassEntry),
+			widget.NewFormItem(s.tr("Repeat new passphrase"), newPassAgainEntry),
 		},
 		func(ok bool) {
 			if !ok {
@@ -1092,12 +1364,12 @@ func (s *uiState) generateOwnerKeyPair() {
 	alias := strings.TrimSpace(s.aliasEntry.Text)
 	email := strings.TrimSpace(s.emailEntry.Text)
 	if alias == "" || email == "" {
-		s.setStatus("Please provide name and email")
+		s.setStatus(s.tr("Please provide name and email"))
 		return
 	}
 	priv, pub, fp, err := generateOwnerKey(alias, email)
 	if err != nil {
-		s.setStatus("Could not generate key: " + err.Error())
+		s.setStatus(s.trf("Could not generate key: %s", err.Error()))
 		return
 	}
 	now := time.Now().UTC().Format(time.RFC3339)
@@ -1109,19 +1381,19 @@ func (s *uiState) generateOwnerKeyPair() {
 	s.aliasEntry.SetText("")
 	s.emailEntry.SetText("")
 	s.refreshKeyDependentViews()
-	s.setStatus("Key pair generated")
+	s.setStatus(s.tr("Key pair generated"))
 }
 
 func (s *uiState) addThirdPartyKey() {
 	alias := strings.TrimSpace(s.importAliasEntry.Text)
 	armored := strings.TrimSpace(s.importKeyEntry.Text)
 	if alias == "" || armored == "" {
-		s.setStatus("Please provide name and public key")
+		s.setStatus(s.tr("Please provide name and public key"))
 		return
 	}
 	k, err := crypto.NewKeyFromArmored(armored)
 	if err != nil {
-		s.setStatus("Public key is invalid: " + err.Error())
+		s.setStatus(s.trf("Public key is invalid: %s", err.Error()))
 		return
 	}
 	s.entries = append(s.entries, keyEntry{
@@ -1136,7 +1408,7 @@ func (s *uiState) addThirdPartyKey() {
 	s.importAliasEntry.SetText("")
 	s.importKeyEntry.SetText("")
 	s.refreshKeyDependentViews()
-	s.setStatus("Public key added")
+	s.setStatus(s.tr("Public key added"))
 }
 
 func (s *uiState) encryptMessage() {
@@ -1152,16 +1424,16 @@ func (s *uiState) encryptMessage() {
 		}
 
 		if signerPriv == "" {
-			s.setStatus("Please choose a signer key or enter one manually")
+			s.setStatus(s.tr("Please choose a signer key or enter one manually"))
 			return
 		}
 		signedText, err := signCleartextMessage(s.plainEntry.Text, signerPriv)
 		if err != nil {
-			s.setStatus("Sign failed: " + err.Error())
+			s.setStatus(s.trf("Sign failed: %s", err.Error()))
 			return
 		}
 		s.cipherEntry.SetText(signedText)
-		s.setStatus("Message signed (cleartext)")
+		s.setStatus(s.tr("Message signed (cleartext)"))
 		return
 	}
 
@@ -1186,22 +1458,22 @@ func (s *uiState) encryptMessage() {
 	}
 
 	if recipientPub == "" || signerPriv == "" {
-		s.setStatus("Please choose keys or enter keys manually")
+		s.setStatus(s.tr("Please choose keys or enter keys manually"))
 		return
 	}
 	cipherText, err := encryptAndSign(s.plainEntry.Text, recipientPub, signerPriv)
 	if err != nil {
-		s.setStatus("Encrypt/sign failed: " + err.Error())
+		s.setStatus(s.trf("Encrypt/sign failed: %s", err.Error()))
 		return
 	}
 	s.cipherEntry.SetText(cipherText)
-	s.setStatus("Message encrypted")
+	s.setStatus(s.tr("Message encrypted"))
 }
 
 func (s *uiState) decryptMessage() {
 	cipherText := s.cipherInputEntry.Text
 	if strings.TrimSpace(cipherText) == "" {
-		s.setStatus("Input message is required")
+		s.setStatus(s.tr("Input message is required"))
 		return
 	}
 
@@ -1217,16 +1489,16 @@ func (s *uiState) decryptMessage() {
 
 	if s.decryptModeVerifyOnly {
 		if pub == "" {
-			s.setStatus("Please choose sender public key or enter one manually")
+			s.setStatus(s.tr("Please choose sender public key or enter one manually"))
 			return
 		}
 		plain, sigStatus, err := verifyCleartextMessage(cipherText, pub)
 		if err != nil {
-			s.setStatus("Verify failed: " + err.Error())
+			s.setStatus(s.trf("Verify failed: %s", err.Error()))
 			return
 		}
 		s.plainOutputEntry.SetText(plain)
-		s.setStatus(sigStatus)
+		s.setStatus(s.localizeSignatureStatus(sigStatus))
 		return
 	}
 
@@ -1242,17 +1514,17 @@ func (s *uiState) decryptMessage() {
 	}
 
 	if priv == "" || pub == "" {
-		s.setStatus("Please choose keys or enter keys manually")
+		s.setStatus(s.tr("Please choose keys or enter keys manually"))
 		return
 	}
 
 	plain, sigStatus, err := decryptAndVerify(cipherText, priv, pub)
 	if err != nil {
-		s.setStatus("Decrypt failed: " + err.Error())
+		s.setStatus(s.trf("Decrypt failed: %s", err.Error()))
 		return
 	}
 	s.plainOutputEntry.SetText(plain)
-	s.setStatus(sigStatus)
+	s.setStatus(s.localizeSignatureStatus(sigStatus))
 }
 
 func (s *uiState) refreshKeyDependentViews() {
@@ -1292,10 +1564,10 @@ func (s *uiState) refreshKeyDependentViews() {
 		s.selectedPairIdx = -1
 		s.showPublic = false
 		s.showPrivate = false
-		s.pairAlias.SetText("No key pair selected")
+		s.pairAlias.SetText(s.tr("No key pair selected"))
 		s.pairFingerprint.SetText("")
 		s.pairPublic.SetText("")
-		s.pairPrivate.SetText("Private key hidden")
+		s.pairPrivate.SetText(s.tr("Private key hidden"))
 		s.refreshPairDetailsUI()
 		return
 	}
@@ -1326,7 +1598,7 @@ func (s *uiState) removeContactByID(id string) {
 	s.entries = filtered
 	s.saveVaultNow()
 	s.refreshKeyDependentViews()
-	s.setStatus("Contact key removed")
+	s.setStatus(s.tr("Contact key removed"))
 }
 
 func (s *uiState) removeOwnerPairAt(i int) {
@@ -1349,13 +1621,13 @@ func (s *uiState) removeOwnerPairAt(i int) {
 	}
 	s.saveVaultNow()
 	s.refreshKeyDependentViews()
-	s.setStatus("Key pair removed")
+	s.setStatus(s.tr("Key pair removed"))
 }
 
 func (s *uiState) pickOpenVaultPath(target *widget.Entry) {
 	dlg := dialog.NewFileOpen(func(rc fyne.URIReadCloser, err error) {
 		if err != nil {
-			s.setStatus("File picker error: " + err.Error())
+			s.setStatus(s.trf("File picker error: %s", err.Error()))
 			return
 		}
 		if rc == nil {
@@ -1363,7 +1635,7 @@ func (s *uiState) pickOpenVaultPath(target *widget.Entry) {
 		}
 		defer rc.Close()
 		target.SetText(normalizeDialogPath(rc.URI()))
-		s.setStatus("Selected vault file")
+		s.setStatus(s.tr("Selected vault file"))
 	}, s.win)
 	dlg.SetFilter(storage.NewExtensionFileFilter([]string{".enc", ".vault", ".csv"}))
 	dlg.Show()
@@ -1372,7 +1644,7 @@ func (s *uiState) pickOpenVaultPath(target *widget.Entry) {
 func (s *uiState) pickSaveVaultPath(target *widget.Entry) {
 	dlg := dialog.NewFileSave(func(wc fyne.URIWriteCloser, err error) {
 		if err != nil {
-			s.setStatus("File picker error: " + err.Error())
+			s.setStatus(s.trf("File picker error: %s", err.Error()))
 			return
 		}
 		if wc == nil {
@@ -1380,7 +1652,7 @@ func (s *uiState) pickSaveVaultPath(target *widget.Entry) {
 		}
 		defer wc.Close()
 		target.SetText(normalizeDialogPath(wc.URI()))
-		s.setStatus("Selected new vault path")
+		s.setStatus(s.tr("Selected new vault path"))
 	}, s.win)
 	dlg.SetFileName("vault.csv.enc")
 	dlg.Show()
@@ -1652,8 +1924,8 @@ func verifyCleartextMessage(signedText, verifyPubArmored string) (string, string
 	return plain, sigStatus, err
 }
 
-func saveVault(path string, passphrase []byte, entries []keyEntry) error {
-	data, err := encodeCSV(entries)
+func saveVault(path string, passphrase []byte, entries []keyEntry, settings vaultSettings) error {
+	data, err := encodeVaultPayload(entries, settings)
 	if err != nil {
 		return err
 	}
@@ -1695,19 +1967,19 @@ func saveVault(path string, passphrase []byte, entries []keyEntry) error {
 	return nil
 }
 
-func loadVault(path string, passphrase []byte) ([]keyEntry, error) {
+func loadVault(path string, passphrase []byte) ([]keyEntry, vaultSettings, bool, error) {
 	blob, err := os.ReadFile(path)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
-			return nil, fmt.Errorf("vault file does not exist")
+			return nil, vaultSettings{}, false, fmt.Errorf("vault file does not exist")
 		}
-		return nil, err
+		return nil, vaultSettings{}, false, err
 	}
 	if len(blob) < len(magicHeader)+saltSize+nonceSize+16 {
-		return nil, errBadFormat
+		return nil, vaultSettings{}, false, errBadFormat
 	}
 	if string(blob[:len(magicHeader)]) != magicHeader {
-		return nil, errBadFormat
+		return nil, vaultSettings{}, false, errBadFormat
 	}
 	salt := blob[len(magicHeader) : len(magicHeader)+saltSize]
 	nonce := blob[len(magicHeader)+saltSize : len(magicHeader)+saltSize+nonceSize]
@@ -1718,22 +1990,55 @@ func loadVault(path string, passphrase []byte) ([]keyEntry, error) {
 
 	block, err := aes.NewCipher(k)
 	if err != nil {
-		return nil, err
+		return nil, vaultSettings{}, false, err
 	}
 	gcm, err := cipher.NewGCM(block)
 	if err != nil {
-		return nil, err
+		return nil, vaultSettings{}, false, err
 	}
 	plain, err := gcm.Open(nil, nonce, ciphertext, nil)
 	if err != nil {
-		return nil, fmt.Errorf("authentication failed")
+		return nil, vaultSettings{}, false, fmt.Errorf("authentication failed")
 	}
-	entries, err := decodeCSV(plain)
+	entries, settings, migrated, err := decodeVaultPayload(plain)
 	zeroBytes(plain)
 	if err != nil {
-		return nil, err
+		return nil, vaultSettings{}, false, err
 	}
-	return entries, nil
+	return entries, settings, migrated, nil
+}
+
+func encodeVaultPayload(entries []keyEntry, settings vaultSettings) ([]byte, error) {
+	settings, _ = normalizeVaultSettings(settings)
+	payload := vaultData{
+		Version:  2,
+		Settings: settings,
+		Entries:  entries,
+	}
+	return json.Marshal(payload)
+}
+
+func decodeVaultPayload(data []byte) ([]keyEntry, vaultSettings, bool, error) {
+	trimmed := bytes.TrimSpace(data)
+	if len(trimmed) > 0 && trimmed[0] == '{' {
+		var payload vaultData
+		if err := json.Unmarshal(trimmed, &payload); err != nil {
+			return nil, vaultSettings{}, false, err
+		}
+		settings, changed := normalizeVaultSettings(payload.Settings)
+		entries := payload.Entries
+		if entries == nil {
+			entries = []keyEntry{}
+		}
+		return entries, settings, changed, nil
+	}
+
+	entries, err := decodeCSV(data)
+	if err != nil {
+		return nil, vaultSettings{}, false, err
+	}
+	settings := defaultVaultSettings()
+	return entries, settings, true, nil
 }
 
 func deriveKey(passphrase, salt []byte) []byte {

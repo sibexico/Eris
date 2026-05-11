@@ -2,6 +2,9 @@ package main
 
 import (
 	"bytes"
+	"crypto/aes"
+	"crypto/cipher"
+	"crypto/rand"
 	"errors"
 	"os"
 	"path/filepath"
@@ -10,6 +13,7 @@ import (
 	"testing"
 
 	"fyne.io/fyne/v2/container"
+	"fyne.io/fyne/v2/test"
 	"fyne.io/fyne/v2/widget"
 )
 
@@ -96,13 +100,19 @@ func TestSaveLoadVaultRoundTrip(t *testing.T) {
 		},
 	}
 
-	if err := saveVault(path, pass, entries); err != nil {
+	if err := saveVault(path, pass, entries, defaultVaultSettings()); err != nil {
 		t.Fatalf("saveVault failed: %v", err)
 	}
 
-	loaded, err := loadVault(path, pass)
+	loaded, settings, migrated, err := loadVault(path, pass)
 	if err != nil {
 		t.Fatalf("loadVault failed: %v", err)
+	}
+	if migrated {
+		t.Fatalf("did not expect migrated=true for newly saved vault")
+	}
+	if settings.Language == "" {
+		t.Fatalf("expected language in vault settings")
 	}
 	if len(loaded) != len(entries) {
 		t.Fatalf("expected %d entries, got %d", len(entries), len(loaded))
@@ -124,11 +134,11 @@ func TestLoadVaultWrongPassphrase(t *testing.T) {
 		CreationDate: "2026-03-30T00:00:00Z",
 	}}
 
-	if err := saveVault(path, []byte("correct passphrase"), entries); err != nil {
+	if err := saveVault(path, []byte("correct passphrase"), entries, defaultVaultSettings()); err != nil {
 		t.Fatalf("saveVault failed: %v", err)
 	}
 
-	_, err := loadVault(path, []byte("wrong passphrase"))
+	_, _, _, err := loadVault(path, []byte("wrong passphrase"))
 	if err == nil {
 		t.Fatalf("expected authentication failure error")
 	}
@@ -218,7 +228,7 @@ func TestEncryptAndSignInvalidSignerKey(t *testing.T) {
 
 func TestLoadVaultMissingFile(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "missing.enc")
-	_, err := loadVault(path, []byte("pass"))
+	_, _, _, err := loadVault(path, []byte("pass"))
 	if err == nil {
 		t.Fatalf("expected error for missing vault file")
 	}
@@ -234,7 +244,7 @@ func TestLoadVaultBadFormat(t *testing.T) {
 			t.Fatalf("os.WriteFile failed: %v", err)
 		}
 
-		_, err := loadVault(path, []byte("pass"))
+		_, _, _, err := loadVault(path, []byte("pass"))
 		if !errors.Is(err, errBadFormat) {
 			t.Fatalf("expected errBadFormat, got %v", err)
 		}
@@ -248,11 +258,90 @@ func TestLoadVaultBadFormat(t *testing.T) {
 			t.Fatalf("os.WriteFile failed: %v", err)
 		}
 
-		_, err := loadVault(path, []byte("pass"))
+		_, _, _, err := loadVault(path, []byte("pass"))
 		if !errors.Is(err, errBadFormat) {
 			t.Fatalf("expected errBadFormat, got %v", err)
 		}
 	})
+}
+
+func TestSaveLoadVaultPersistsLanguageSetting(t *testing.T) {
+	tmp := t.TempDir()
+	path := filepath.Join(tmp, "vault.csv.enc")
+	pass := []byte("correct horse battery staple")
+
+	entries := sampleEntries()
+	settings := vaultSettings{Language: "es"}
+	if err := saveVault(path, pass, entries, settings); err != nil {
+		t.Fatalf("saveVault failed: %v", err)
+	}
+
+	loaded, gotSettings, migrated, err := loadVault(path, pass)
+	if err != nil {
+		t.Fatalf("loadVault failed: %v", err)
+	}
+	if migrated {
+		t.Fatalf("did not expect migrated=true for settings-aware vault")
+	}
+	if gotSettings.Language != "es" {
+		t.Fatalf("expected saved language es, got %q", gotSettings.Language)
+	}
+	if len(loaded) != len(entries) {
+		t.Fatalf("expected %d entries, got %d", len(entries), len(loaded))
+	}
+}
+
+func TestLoadVaultMigratesLegacyCSVPayload(t *testing.T) {
+	tmp := t.TempDir()
+	path := filepath.Join(tmp, "legacy.csv.enc")
+	pass := []byte("correct horse battery staple")
+
+	csvData, err := encodeCSV(sampleEntries())
+	if err != nil {
+		t.Fatalf("encodeCSV failed: %v", err)
+	}
+
+	salt := make([]byte, saltSize)
+	if _, err := rand.Read(salt); err != nil {
+		t.Fatalf("rand.Read(salt) failed: %v", err)
+	}
+	nonce := make([]byte, nonceSize)
+	if _, err := rand.Read(nonce); err != nil {
+		t.Fatalf("rand.Read(nonce) failed: %v", err)
+	}
+	k := deriveKey(pass, salt)
+	defer zeroBytes(k)
+
+	block, err := aes.NewCipher(k)
+	if err != nil {
+		t.Fatalf("aes.NewCipher failed: %v", err)
+	}
+	gcm, err := cipher.NewGCM(block)
+	if err != nil {
+		t.Fatalf("cipher.NewGCM failed: %v", err)
+	}
+	ciphertext := gcm.Seal(nil, nonce, csvData, nil)
+	blob := append([]byte(magicHeader), salt...)
+	blob = append(blob, nonce...)
+	blob = append(blob, ciphertext...)
+
+	if err := os.WriteFile(path, blob, 0o600); err != nil {
+		t.Fatalf("os.WriteFile failed: %v", err)
+	}
+
+	loaded, settings, migrated, err := loadVault(path, pass)
+	if err != nil {
+		t.Fatalf("loadVault failed: %v", err)
+	}
+	if !migrated {
+		t.Fatalf("expected migrated=true for legacy CSV vault")
+	}
+	if settings.Language == "" {
+		t.Fatalf("expected default language injected during migration")
+	}
+	if len(loaded) != 2 {
+		t.Fatalf("expected 2 entries from legacy CSV, got %d", len(loaded))
+	}
 }
 
 func TestDecodeCSVMalformedRowsReturnsError(t *testing.T) {
@@ -394,14 +483,14 @@ func TestOpenCreateVaultValidationPaths(t *testing.T) {
 	s.vaultPathEntry = widget.NewEntry()
 	s.passphraseEntry = widget.NewPasswordEntry()
 	s.openVault()
-	if got := s.statusLabel.Text; got != "Choose a vault file first" {
+	if got := s.statusLabel.Text; got != s.tr("Choose a vault file first") {
 		t.Fatalf("unexpected status for empty open path: %q", got)
 	}
 
 	s.vaultPathEntry.SetText("vault.csv.enc")
 	s.passphraseEntry.SetText("short")
 	s.openVault()
-	if got := s.statusLabel.Text; got != "Passphrase must be at least 8 characters" {
+	if got := s.statusLabel.Text; got != s.tr("Passphrase must be at least 8 characters") {
 		t.Fatalf("unexpected status for short open passphrase: %q", got)
 	}
 
@@ -409,7 +498,7 @@ func TestOpenCreateVaultValidationPaths(t *testing.T) {
 	s.createPassEntry = widget.NewPasswordEntry()
 	s.createPassAgainEntry = widget.NewPasswordEntry()
 	s.createVault()
-	if got := s.statusLabel.Text; got != "Choose where to save the vault" {
+	if got := s.statusLabel.Text; got != s.tr("Choose where to save the vault") {
 		t.Fatalf("unexpected status for empty create path: %q", got)
 	}
 
@@ -417,14 +506,14 @@ func TestOpenCreateVaultValidationPaths(t *testing.T) {
 	s.createPassEntry.SetText("short")
 	s.createPassAgainEntry.SetText("short")
 	s.createVault()
-	if got := s.statusLabel.Text; got != "Passphrase must be at least 8 characters" {
+	if got := s.statusLabel.Text; got != s.tr("Passphrase must be at least 8 characters") {
 		t.Fatalf("unexpected status for short create passphrase: %q", got)
 	}
 
 	s.createPassEntry.SetText("long-enough-pass")
 	s.createPassAgainEntry.SetText("different-pass")
 	s.createVault()
-	if got := s.statusLabel.Text; got != "Passphrases do not match" {
+	if got := s.statusLabel.Text; got != s.tr("Passphrases do not match") {
 		t.Fatalf("unexpected status for mismatched create passphrase: %q", got)
 	}
 }
@@ -460,7 +549,7 @@ func TestRefreshEncryptVisibilityAndMode(t *testing.T) {
 
 	s.encryptModeSignOnly = false
 	s.refreshEncryptActionMode()
-	if s.encryptModeLabel.Text != "Mode: Encrypt" || s.encryptActionBtn.Text != "Encrypt message" {
+	if s.encryptModeLabel.Text != s.tr("Mode: Encrypt") || s.encryptActionBtn.Text != s.tr("Encrypt message") {
 		t.Fatalf("unexpected encrypt mode labels: %q / %q", s.encryptModeLabel.Text, s.encryptActionBtn.Text)
 	}
 	if !s.encryptRecipientBox.Visible() {
@@ -469,7 +558,7 @@ func TestRefreshEncryptVisibilityAndMode(t *testing.T) {
 
 	s.encryptModeSignOnly = true
 	s.refreshEncryptActionMode()
-	if s.encryptModeLabel.Text != "Mode: Sign" || s.encryptActionBtn.Text != "Sign message" {
+	if s.encryptModeLabel.Text != s.tr("Mode: Sign") || s.encryptActionBtn.Text != s.tr("Sign message") {
 		t.Fatalf("unexpected sign mode labels: %q / %q", s.encryptModeLabel.Text, s.encryptActionBtn.Text)
 	}
 	if s.encryptRecipientBox.Visible() {
@@ -509,7 +598,7 @@ func TestRefreshDecryptVisibilityAndMode(t *testing.T) {
 
 	s.decryptModeVerifyOnly = false
 	s.refreshDecryptActionMode()
-	if s.decryptModeLabel.Text != "Mode: Decrypt" || s.decryptActionBtn.Text != "Decrypt message" {
+	if s.decryptModeLabel.Text != s.tr("Mode: Decrypt") || s.decryptActionBtn.Text != s.tr("Decrypt message") {
 		t.Fatalf("unexpected decrypt mode labels: %q / %q", s.decryptModeLabel.Text, s.decryptActionBtn.Text)
 	}
 	if !s.decryptKeyBox.Visible() {
@@ -518,13 +607,13 @@ func TestRefreshDecryptVisibilityAndMode(t *testing.T) {
 
 	s.decryptModeVerifyOnly = true
 	s.refreshDecryptActionMode()
-	if s.decryptModeLabel.Text != "Mode: Verify" || s.decryptActionBtn.Text != "Verify message" {
+	if s.decryptModeLabel.Text != s.tr("Mode: Verify") || s.decryptActionBtn.Text != s.tr("Verify message") {
 		t.Fatalf("unexpected verify mode labels: %q / %q", s.decryptModeLabel.Text, s.decryptActionBtn.Text)
 	}
 	if s.decryptKeyBox.Visible() {
 		t.Fatalf("decrypt key selector should be hidden in verify mode")
 	}
-	if got := s.cipherInputEntry.PlaceHolder; got != "Signed cleartext message" {
+	if got := s.cipherInputEntry.PlaceHolder; got != s.tr("Signed cleartext message") {
 		t.Fatalf("unexpected verify placeholder: %q", got)
 	}
 }
@@ -549,10 +638,10 @@ func TestRefreshPairDetailsUIWithButtons(t *testing.T) {
 	s.pairPrivate = widget.NewMultiLineEntry()
 
 	s.refreshPairDetailsUIWithButtons(showPub, copyPub, showPriv, hidePriv)
-	if s.pairAlias.Text != "Alias: me" {
+	if s.pairAlias.Text != s.tr("Alias: ")+"me" {
 		t.Fatalf("unexpected alias label: %q", s.pairAlias.Text)
 	}
-	if s.pairPrivate.Text != "Private key hidden" {
+	if s.pairPrivate.Text != s.tr("Private key hidden") {
 		t.Fatalf("private key should be hidden by default")
 	}
 
@@ -562,4 +651,221 @@ func TestRefreshPairDetailsUIWithButtons(t *testing.T) {
 	if s.pairPrivate.Text != "PRIV" {
 		t.Fatalf("expected visible private key content")
 	}
+}
+
+func TestNormalizeLanguageCode(t *testing.T) {
+	tests := []struct {
+		in   string
+		want string
+	}{
+		{"", "en"},
+		{"es_ES.UTF-8", "es"},
+		{"en-US", "en"},
+		{"pt_BR", "pt"},
+		{"C", "en"},
+	}
+	for _, tt := range tests {
+		if got := normalizeLanguageCode(tt.in); got != tt.want {
+			t.Fatalf("normalizeLanguageCode(%q) = %q, want %q", tt.in, got, tt.want)
+		}
+	}
+}
+
+func TestNewLocalizerAndTranslationLookup(t *testing.T) {
+	t.Setenv("LANGUAGE", "")
+	t.Setenv("LC_ALL", "")
+	t.Setenv("LC_MESSAGES", "")
+	t.Setenv("LANG", "es_ES.UTF-8")
+
+	l := newLocalizer()
+	if got := l.Language(); got != "es" {
+		t.Fatalf("expected detected language es, got %q", got)
+	}
+	if got := l.T("Settings"); got == "Settings" {
+		t.Fatalf("expected translated Settings in Spanish")
+	}
+	if !l.SetLanguage("en") {
+		t.Fatalf("expected SetLanguage(en) to succeed")
+	}
+	if l.T("does-not-exist") != "does-not-exist" {
+		t.Fatalf("unknown translation keys should fall back to source text")
+	}
+	if l.SetLanguage("zz") {
+		t.Fatalf("unexpected success setting unsupported language")
+	}
+}
+
+func TestVaultSettingsNormalization(t *testing.T) {
+	orig := appLocalizer.Language()
+	defer appLocalizer.SetLanguage(orig)
+
+	_ = appLocalizer.SetLanguage("es")
+	defaults := defaultVaultSettings()
+	if defaults.Language != "es" {
+		t.Fatalf("expected default settings language es, got %q", defaults.Language)
+	}
+
+	normalized, changed := normalizeVaultSettings(vaultSettings{Language: "xx"})
+	if !changed {
+		t.Fatalf("expected normalizeVaultSettings to report change for invalid language")
+	}
+	if normalized.Language != "en" {
+		t.Fatalf("expected fallback language en, got %q", normalized.Language)
+	}
+}
+
+func TestEncodeDecodeVaultPayloadRoundTrip(t *testing.T) {
+	entries := sampleEntries()
+	settings := vaultSettings{Language: "es"}
+
+	b, err := encodeVaultPayload(entries, settings)
+	if err != nil {
+		t.Fatalf("encodeVaultPayload failed: %v", err)
+	}
+
+	decodedEntries, decodedSettings, migrated, err := decodeVaultPayload(b)
+	if err != nil {
+		t.Fatalf("decodeVaultPayload failed: %v", err)
+	}
+	if migrated {
+		t.Fatalf("did not expect migrated=true for JSON payload")
+	}
+	if decodedSettings.Language != "es" {
+		t.Fatalf("expected language es, got %q", decodedSettings.Language)
+	}
+	if len(decodedEntries) != len(entries) {
+		t.Fatalf("expected %d entries, got %d", len(entries), len(decodedEntries))
+	}
+}
+
+func TestDecodeVaultPayloadMalformedJSON(t *testing.T) {
+	_, _, _, err := decodeVaultPayload([]byte("{invalid-json"))
+	if err == nil {
+		t.Fatalf("expected error for malformed JSON vault payload")
+	}
+}
+
+func TestWithSecretAndZeroBytes(t *testing.T) {
+	called := false
+	withSecret(func() {
+		called = true
+	})
+	if !called {
+		t.Fatalf("withSecret did not execute callback")
+	}
+
+	b := []byte("secret")
+	zeroBytes(b)
+	for i, v := range b {
+		if v != 0 {
+			t.Fatalf("expected zeroed byte at index %d, got %d", i, v)
+		}
+	}
+}
+
+func TestHardenProcessCallable(t *testing.T) {
+	if err := hardenProcess(); err != nil {
+		// Security hardening can fail in constrained environments; this test ensures path is exercised.
+		t.Logf("hardenProcess returned warning: %v", err)
+	}
+}
+
+func TestUILoadVaultFlowAndLanguagePersistence(t *testing.T) {
+	origLang := appLocalizer.Language()
+	defer appLocalizer.SetLanguage(origLang)
+
+	a := test.NewApp()
+	defer a.Quit()
+	w := a.NewWindow("test")
+	s := newUIState(a, w)
+
+	pass := "correct horse battery staple"
+	path := filepath.Join(t.TempDir(), "vault.csv.enc")
+	if err := saveVault(path, []byte(pass), sampleEntries(), vaultSettings{Language: "es"}); err != nil {
+		t.Fatalf("saveVault failed: %v", err)
+	}
+
+	s.vaultPathEntry.SetText(path)
+	s.passphraseEntry.SetText(pass)
+	s.openVault()
+
+	if s.vaultPath != path {
+		t.Fatalf("expected loaded vault path %q, got %q", path, s.vaultPath)
+	}
+	if len(s.entries) != len(sampleEntries()) {
+		t.Fatalf("expected %d entries after open, got %d", len(sampleEntries()), len(s.entries))
+	}
+	if appLocalizer.Language() != "es" {
+		t.Fatalf("expected language loaded from vault to be es, got %q", appLocalizer.Language())
+	}
+
+	s.settings.Language = "en"
+	s.saveVaultNow()
+
+	_, settings, _, err := loadVault(path, []byte(pass))
+	if err != nil {
+		t.Fatalf("loadVault after language switch failed: %v", err)
+	}
+	if settings.Language != "en" {
+		t.Fatalf("expected persisted language en after switch, got %q", settings.Language)
+	}
+}
+
+func TestUICreateVaultSuccessFlow(t *testing.T) {
+	origLang := appLocalizer.Language()
+	defer appLocalizer.SetLanguage(origLang)
+
+	a := test.NewApp()
+	defer a.Quit()
+	w := a.NewWindow("test")
+	s := newUIState(a, w)
+
+	path := filepath.Join(t.TempDir(), "created.csv.enc")
+	pass := "long-enough-passphrase"
+	s.createPathEntry.SetText(path)
+	s.createPassEntry.SetText(pass)
+	s.createPassAgainEntry.SetText(pass)
+
+	s.createVault()
+
+	if s.vaultPath != path {
+		t.Fatalf("expected vaultPath %q, got %q", path, s.vaultPath)
+	}
+	if len(s.passphrase) == 0 {
+		t.Fatalf("expected in-memory passphrase after create")
+	}
+	_, settings, migrated, err := loadVault(path, []byte(pass))
+	if err != nil {
+		t.Fatalf("created vault failed to load: %v", err)
+	}
+	if migrated {
+		t.Fatalf("did not expect migrated=true for newly created vault")
+	}
+	if settings.Language == "" {
+		t.Fatalf("expected language settings in created vault")
+	}
+}
+
+func TestUIHelpersAndLocalizationUtilities(t *testing.T) {
+	a := test.NewApp()
+	defer a.Quit()
+	w := a.NewWindow("test")
+	s := newUIState(a, w)
+
+	if got := s.trf("Unlock failed: %s", "x"); !strings.Contains(got, "x") {
+		t.Fatalf("expected formatted translation to include arg, got %q", got)
+	}
+	if got := s.localizeSignatureStatus("Signature: OK"); got == "Signature: OK" && s.tr("Signature: OK") != "Signature: OK" {
+		t.Fatalf("expected localized signature status")
+	}
+	if got := s.localizeSignatureStatus("Signature: FAILED (bad)"); !strings.Contains(got, "bad") {
+		t.Fatalf("expected localized failed signature to retain reason, got %q", got)
+	}
+
+	_ = s.multilineField(widget.NewMultiLineEntry())
+	_ = s.centerBlock(widget.NewLabel("x"))
+	_ = s.wrapWithStatus(widget.NewLabel("x"))
+	s.showStartup()
+	s.showMainUI()
+	s.changeVault()
 }
