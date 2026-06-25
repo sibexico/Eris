@@ -52,6 +52,8 @@
   "Generate key pair": "Generar par de claves",
   "Show public key": "Mostrar clave pública",
   "Copy": "Copiar",
+  "Copy fingerprint": "Copiar huella",
+  "Fingerprint copied": "Huella copiada",
   "Public key copied": "Clave pública copiada",
   "Show private key": "Mostrar clave privada",
   "Hide private key": "Ocultar clave privada",

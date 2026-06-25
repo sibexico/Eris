@@ -37,6 +37,7 @@ const (
 	magicHeader = "PGPM"
 	saltSize    = 16
 	nonceSize   = 12
+	manualKey   = "Enter the key"
 )
 
 var errBadFormat = errors.New("invalid vault format")
@@ -161,7 +162,9 @@ const (
 
 type keyEntry struct {
 	ID           string
+	PairID       string
 	Alias        string
+	Email        string
 	KeyType      keyType
 	KeyData      string
 	Fingerprint  string
@@ -169,7 +172,11 @@ type keyEntry struct {
 }
 
 type ownerPair struct {
+	PairID      string
+	PrivateID   string
+	PublicID    string
 	Alias       string
+	Email       string
 	Fingerprint string
 	Public      string
 	Private     string
@@ -343,6 +350,9 @@ type uiState struct {
 
 	statusLabel *widget.Label
 	languageSel *widget.Select
+
+	recipientOptionToID map[string]string
+	signerOptionToID    map[string]string
 }
 
 func (s *uiState) tr(text string) string {
@@ -413,9 +423,11 @@ func handleCLIArgs(args []string) bool {
 
 func newUIState(a fyne.App, w fyne.Window) *uiState {
 	s := &uiState{
-		app:      a,
-		win:      w,
-		settings: defaultVaultSettings(),
+		app:                 a,
+		win:                 w,
+		settings:            defaultVaultSettings(),
+		recipientOptionToID: make(map[string]string),
+		signerOptionToID:    make(map[string]string),
 	}
 
 	s.vaultPathEntry = widget.NewEntry()
@@ -492,17 +504,17 @@ func newUIState(a fyne.App, w fyne.Window) *uiState {
 
 	s.statusLabel = widget.NewLabel(s.tr("Ready"))
 
-	s.encryptRecipientSelect = widget.NewSelect([]string{"Enter the key"}, func(_ string) { s.refreshEncryptManualVisibility() })
-	s.encryptRecipientSelect.SetSelected("Enter the key")
+	s.encryptRecipientSelect = widget.NewSelect([]string{manualKey}, func(_ string) { s.refreshEncryptManualVisibility() })
+	s.encryptRecipientSelect.SetSelected(manualKey)
 
-	s.encryptSignerSelect = widget.NewSelect([]string{"Enter the key"}, func(_ string) { s.refreshEncryptManualVisibility() })
-	s.encryptSignerSelect.SetSelected("Enter the key")
+	s.encryptSignerSelect = widget.NewSelect([]string{manualKey}, func(_ string) { s.refreshEncryptManualVisibility() })
+	s.encryptSignerSelect.SetSelected(manualKey)
 
-	s.decryptKeySelect = widget.NewSelect([]string{"Enter the key"}, func(_ string) { s.refreshDecryptManualVisibility() })
-	s.decryptKeySelect.SetSelected("Enter the key")
+	s.decryptKeySelect = widget.NewSelect([]string{manualKey}, func(_ string) { s.refreshDecryptManualVisibility() })
+	s.decryptKeySelect.SetSelected(manualKey)
 
-	s.verifyKeySelect = widget.NewSelect([]string{"Enter the key"}, func(_ string) { s.refreshDecryptManualVisibility() })
-	s.verifyKeySelect.SetSelected("Enter the key")
+	s.verifyKeySelect = widget.NewSelect([]string{manualKey}, func(_ string) { s.refreshDecryptManualVisibility() })
+	s.verifyKeySelect.SetSelected(manualKey)
 
 	s.encryptRecipientManual = s.multilineField(s.encryptRecipientEntry)
 	s.encryptSignerManual = s.multilineField(s.encryptSignerEntry)
@@ -531,7 +543,11 @@ func newUIState(a fyne.App, w fyne.Window) *uiState {
 				return
 			}
 			btn.SetText(s.tr("Remove"))
-			lbl.SetText(fmt.Sprintf("%s | %s", s.pairs[i].Alias, s.pairs[i].Fingerprint))
+			email := strings.TrimSpace(s.pairs[i].Email)
+			if email == "" {
+				email = "-"
+			}
+			lbl.SetText(fmt.Sprintf("%s | %s | %s", s.pairs[i].Alias, email, s.pairs[i].Fingerprint))
 			idx := i
 			btn.OnTapped = func() {
 				s.removeOwnerPairAt(idx)
@@ -800,9 +816,14 @@ func (s *uiState) buildMyKeysTab() fyne.CanvasObject {
 	detailsCard := widget.NewCard(s.tr("Selected key pair"), s.tr("Public and private key fields appear only when requested."), s.pairDetailsBox)
 	s.refreshPairDetailsUIWithButtons(showPublicBtn, copyPublicBtn, revealBtn, hideBtn)
 
+	listHeight := float32(240)
+	listSpacer := canvas.NewRectangle(color.Transparent)
+	listSpacer.SetMinSize(fyne.NewSize(0, listHeight))
+	myKeysListView := container.NewStack(listSpacer, s.pairsList)
+
 	content := container.NewVBox(
 		s.centerBlock(createForm),
-		s.centerBlock(widget.NewCard(s.tr("My key pairs"), s.tr("Select a row and use Remove for deletion."), s.pairsList)),
+		s.centerBlock(widget.NewCard(s.tr("My key pairs"), s.tr("Select a row and use Remove for deletion."), myKeysListView)),
 		s.centerBlock(detailsCard),
 	)
 	return container.NewVScroll(content)
@@ -895,7 +916,7 @@ func (s *uiState) multilineField(ed *widget.Entry) fyne.CanvasObject {
 	spacer := canvas.NewRectangle(color.Transparent)
 	spacer.SetMinSize(fyne.NewSize(0, height))
 	scroll := container.NewVScroll(ed)
-	box := container.NewMax(spacer, scroll)
+	box := container.NewStack(spacer, scroll)
 	return box
 }
 
@@ -906,7 +927,7 @@ func (s *uiState) centerBlock(obj fyne.CanvasObject) fyne.CanvasObject {
 	}
 	spacer := canvas.NewRectangle(color.Transparent)
 	spacer.SetMinSize(fyne.NewSize(width, obj.MinSize().Height))
-	host := container.NewMax(spacer, obj)
+	host := container.NewStack(spacer, obj)
 	return container.NewHBox(layout.NewSpacer(), host, layout.NewSpacer())
 }
 
@@ -915,14 +936,14 @@ func (s *uiState) refreshEncryptManualVisibility() {
 		return
 	}
 	if s.encryptRecipientManual != nil {
-		if s.encryptRecipientSelect.Selected == "Enter the key" {
+		if s.encryptRecipientSelect.Selected == manualKey {
 			s.encryptRecipientManual.Show()
 		} else {
 			s.encryptRecipientManual.Hide()
 		}
 	}
 	if s.encryptSignerManual != nil {
-		if s.encryptSignerSelect.Selected == "Enter the key" {
+		if s.encryptSignerSelect.Selected == manualKey {
 			s.encryptSignerManual.Show()
 		} else {
 			s.encryptSignerManual.Hide()
@@ -1017,14 +1038,14 @@ func (s *uiState) refreshDecryptManualVisibility() {
 		return
 	}
 	if s.decryptKeyManual != nil {
-		if s.decryptKeySelect.Selected == "Enter the key" {
+		if s.decryptKeySelect.Selected == manualKey {
 			s.decryptKeyManual.Show()
 		} else {
 			s.decryptKeyManual.Hide()
 		}
 	}
 	if s.verifyKeyManual != nil {
-		if s.verifyKeySelect.Selected == "Enter the key" {
+		if s.verifyKeySelect.Selected == manualKey {
 			s.verifyKeyManual.Show()
 		} else {
 			s.verifyKeyManual.Hide()
@@ -1166,7 +1187,12 @@ func (s *uiState) refreshPairDetailsUIWithButtons(showPublicBtn, copyPublicBtn, 
 		s.pairPrivate.SetText(s.tr("Private key hidden"))
 	}
 
-	objs := []fyne.CanvasObject{s.pairAlias, s.pairFingerprint}
+	copyFingerprintBtn := widget.NewButton(s.tr("Copy fingerprint"), func() {
+		s.app.Clipboard().SetContent(pair.Fingerprint)
+		s.setStatus(s.tr("Fingerprint copied"))
+	})
+
+	objs := []fyne.CanvasObject{s.pairAlias, container.NewHBox(s.pairFingerprint, copyFingerprintBtn)}
 	if s.showPublic {
 		objs = append(objs,
 			container.NewHBox(widget.NewLabel(s.tr("Public key")), showPublicBtn, copyPublicBtn),
@@ -1373,9 +1399,10 @@ func (s *uiState) generateOwnerKeyPair() {
 		return
 	}
 	now := time.Now().UTC().Format(time.RFC3339)
+	pairID := newUUID()
 	s.entries = append(s.entries,
-		keyEntry{ID: newUUID(), Alias: alias, KeyType: ownerPrivate, KeyData: b64(priv), Fingerprint: fp, CreationDate: now},
-		keyEntry{ID: newUUID(), Alias: alias, KeyType: ownerPublic, KeyData: b64(pub), Fingerprint: fp, CreationDate: now},
+		keyEntry{ID: newUUID(), PairID: pairID, Alias: alias, Email: email, KeyType: ownerPrivate, KeyData: b64(priv), Fingerprint: fp, CreationDate: now},
+		keyEntry{ID: newUUID(), PairID: pairID, Alias: alias, Email: email, KeyType: ownerPublic, KeyData: b64(pub), Fingerprint: fp, CreationDate: now},
 	)
 	s.saveVaultNow()
 	s.aliasEntry.SetText("")
@@ -1414,10 +1441,10 @@ func (s *uiState) addThirdPartyKey() {
 func (s *uiState) encryptMessage() {
 	signerPriv := ""
 	if s.encryptModeSignOnly {
-		if s.encryptSignerSelect.Selected == "Enter the key" {
+		if s.encryptSignerSelect.Selected == manualKey {
 			signerPriv = strings.TrimSpace(s.encryptSignerEntry.Text)
 		} else {
-			signer := s.findKey(s.encryptSignerSelect.Selected, ownerPrivate)
+			signer := s.findKeyByOption(s.encryptSignerSelect.Selected, ownerPrivate)
 			if signer != nil {
 				signerPriv = deb64(signer.KeyData)
 			}
@@ -1439,19 +1466,19 @@ func (s *uiState) encryptMessage() {
 
 	recipientPub := ""
 
-	if s.encryptRecipientSelect.Selected == "Enter the key" {
+	if s.encryptRecipientSelect.Selected == manualKey {
 		recipientPub = strings.TrimSpace(s.encryptRecipientEntry.Text)
 	} else {
-		rec := s.findKey(s.encryptRecipientSelect.Selected, thirdParty)
+		rec := s.findKeyByOption(s.encryptRecipientSelect.Selected, thirdParty)
 		if rec != nil {
 			recipientPub = deb64(rec.KeyData)
 		}
 	}
 
-	if s.encryptSignerSelect.Selected == "Enter the key" {
+	if s.encryptSignerSelect.Selected == manualKey {
 		signerPriv = strings.TrimSpace(s.encryptSignerEntry.Text)
 	} else {
-		signer := s.findKey(s.encryptSignerSelect.Selected, ownerPrivate)
+		signer := s.findKeyByOption(s.encryptSignerSelect.Selected, ownerPrivate)
 		if signer != nil {
 			signerPriv = deb64(signer.KeyData)
 		}
@@ -1478,10 +1505,10 @@ func (s *uiState) decryptMessage() {
 	}
 
 	pub := ""
-	if s.verifyKeySelect.Selected == "Enter the key" {
+	if s.verifyKeySelect.Selected == manualKey {
 		pub = strings.TrimSpace(s.verifyKeyEntry.Text)
 	} else {
-		ver := s.findKey(s.verifyKeySelect.Selected, thirdParty)
+		ver := s.findKeyByOption(s.verifyKeySelect.Selected, thirdParty)
 		if ver != nil {
 			pub = deb64(ver.KeyData)
 		}
@@ -1504,10 +1531,10 @@ func (s *uiState) decryptMessage() {
 
 	priv := ""
 
-	if s.decryptKeySelect.Selected == "Enter the key" {
+	if s.decryptKeySelect.Selected == manualKey {
 		priv = strings.TrimSpace(s.decryptKeyEntry.Text)
 	} else {
-		dec := s.findKey(s.decryptKeySelect.Selected, ownerPrivate)
+		dec := s.findKeyByOption(s.decryptKeySelect.Selected, ownerPrivate)
 		if dec != nil {
 			priv = deb64(dec.KeyData)
 		}
@@ -1536,8 +1563,10 @@ func (s *uiState) refreshKeyDependentViews() {
 		s.contactsList.Refresh()
 	}
 
-	recipientOptions := s.encryptOptionsRecipient()
-	signerOptions := s.encryptOptionsSigner()
+	recipientOptions, recipientOptionToID := s.encryptOptionsRecipient()
+	signerOptions, signerOptionToID := s.encryptOptionsSigner()
+	s.recipientOptionToID = recipientOptionToID
+	s.signerOptionToID = signerOptionToID
 
 	s.encryptRecipientSelect.SetOptions(recipientOptions)
 	s.encryptSignerSelect.SetOptions(signerOptions)
@@ -1545,16 +1574,16 @@ func (s *uiState) refreshKeyDependentViews() {
 	s.verifyKeySelect.SetOptions(recipientOptions)
 
 	if !containsOption(recipientOptions, s.encryptRecipientSelect.Selected) {
-		s.encryptRecipientSelect.SetSelected("Enter the key")
+		s.encryptRecipientSelect.SetSelected(manualKey)
 	}
 	if !containsOption(signerOptions, s.encryptSignerSelect.Selected) {
-		s.encryptSignerSelect.SetSelected("Enter the key")
+		s.encryptSignerSelect.SetSelected(manualKey)
 	}
 	if !containsOption(signerOptions, s.decryptKeySelect.Selected) {
-		s.decryptKeySelect.SetSelected("Enter the key")
+		s.decryptKeySelect.SetSelected(manualKey)
 	}
 	if !containsOption(recipientOptions, s.verifyKeySelect.Selected) {
-		s.verifyKeySelect.SetSelected("Enter the key")
+		s.verifyKeySelect.SetSelected(manualKey)
 	}
 
 	s.refreshEncryptManualVisibility()
@@ -1608,7 +1637,7 @@ func (s *uiState) removeOwnerPairAt(i int) {
 	p := s.pairs[i]
 	filtered := make([]keyEntry, 0, len(s.entries))
 	for _, e := range s.entries {
-		if e.Alias == p.Alias && e.Fingerprint == p.Fingerprint && (e.KeyType == ownerPrivate || e.KeyType == ownerPublic) {
+		if e.ID == p.PrivateID || e.ID == p.PublicID {
 			continue
 		}
 		filtered = append(filtered, e)
@@ -1681,56 +1710,122 @@ func containsOption(options []string, want string) bool {
 	return false
 }
 
-func (s *uiState) findKey(alias string, t keyType) *keyEntry {
+func (s *uiState) findKeyByID(id string, t keyType) *keyEntry {
 	for i := range s.entries {
-		if s.entries[i].Alias == alias && s.entries[i].KeyType == t {
+		if s.entries[i].ID == id && s.entries[i].KeyType == t {
 			return &s.entries[i]
 		}
 	}
 	return nil
 }
 
-func (s *uiState) ownerPairs() []ownerPair {
-	pubByAlias := make(map[string]keyEntry)
-	for _, e := range s.entries {
-		if e.KeyType == ownerPublic {
-			pubByAlias[e.Alias] = e
-		}
+func (s *uiState) findKeyByOption(option string, t keyType) *keyEntry {
+	if option == manualKey {
+		return nil
 	}
-	pairs := make([]ownerPair, 0)
+	id := ""
+	if t == thirdParty {
+		id = s.recipientOptionToID[option]
+	} else {
+		id = s.signerOptionToID[option]
+	}
+	if id == "" {
+		return nil
+	}
+	return s.findKeyByID(id, t)
+}
+
+func (s *uiState) ownerPairs() []ownerPair {
+	pairByID := make(map[string]ownerPair)
+	ordered := make([]string, 0)
+
 	for _, e := range s.entries {
 		if e.KeyType != ownerPrivate {
 			continue
 		}
-		pub := pubByAlias[e.Alias]
-		pairs = append(pairs, ownerPair{
-			Alias:       e.Alias,
-			Fingerprint: e.Fingerprint,
-			Public:      deb64(pub.KeyData),
-			Private:     deb64(e.KeyData),
-		})
+		pairID := strings.TrimSpace(e.PairID)
+		if pairID == "" {
+			pairID = e.ID
+		}
+		pair, exists := pairByID[pairID]
+		if !exists {
+			ordered = append(ordered, pairID)
+		}
+		pair.PairID = pairID
+		pair.PrivateID = e.ID
+		pair.Alias = e.Alias
+		pair.Email = e.Email
+		pair.Fingerprint = e.Fingerprint
+		pair.Private = deb64(e.KeyData)
+		pairByID[pairID] = pair
+	}
+
+	for _, e := range s.entries {
+		if e.KeyType != ownerPublic {
+			continue
+		}
+		pairID := strings.TrimSpace(e.PairID)
+		if pairID == "" {
+			pairID = e.ID
+		}
+		pair, exists := pairByID[pairID]
+		if !exists {
+			ordered = append(ordered, pairID)
+		}
+		if pair.Alias == "" {
+			pair.Alias = e.Alias
+		}
+		if pair.Email == "" {
+			pair.Email = e.Email
+		}
+		if pair.Fingerprint == "" {
+			pair.Fingerprint = e.Fingerprint
+		}
+		pair.PairID = pairID
+		pair.PublicID = e.ID
+		pair.Public = deb64(e.KeyData)
+		pairByID[pairID] = pair
+	}
+
+	pairs := make([]ownerPair, 0, len(ordered))
+	for _, pairID := range ordered {
+		pair := pairByID[pairID]
+		if pair.PrivateID == "" {
+			continue
+		}
+		pairs = append(pairs, pair)
 	}
 	return pairs
 }
 
-func (s *uiState) encryptOptionsRecipient() []string {
-	opts := []string{"Enter the key"}
+func (s *uiState) encryptOptionsRecipient() ([]string, map[string]string) {
+	opts := []string{manualKey}
+	optionToID := make(map[string]string)
 	for _, e := range s.entries {
 		if e.KeyType == thirdParty {
-			opts = append(opts, e.Alias)
+			opt := fmt.Sprintf("%s | %s | #%s", e.Alias, e.Fingerprint, e.ID)
+			opts = append(opts, opt)
+			optionToID[opt] = e.ID
 		}
 	}
-	return opts
+	return opts, optionToID
 }
 
-func (s *uiState) encryptOptionsSigner() []string {
-	opts := []string{"Enter the key"}
+func (s *uiState) encryptOptionsSigner() ([]string, map[string]string) {
+	opts := []string{manualKey}
+	optionToID := make(map[string]string)
 	for _, e := range s.entries {
 		if e.KeyType == ownerPrivate {
-			opts = append(opts, e.Alias)
+			email := strings.TrimSpace(e.Email)
+			if email == "" {
+				email = "-"
+			}
+			opt := fmt.Sprintf("%s | %s | %s | #%s", e.Alias, email, e.Fingerprint, e.ID)
+			opts = append(opts, opt)
+			optionToID[opt] = e.ID
 		}
 	}
-	return opts
+	return opts, optionToID
 }
 
 func summarizeKeys(entries []keyEntry) string {
@@ -1739,7 +1834,7 @@ func summarizeKeys(entries []keyEntry) string {
 	}
 	var b strings.Builder
 	for _, e := range entries {
-		fmt.Fprintf(&b, "- %s | %s | %s\n", e.Alias, e.KeyType, e.Fingerprint)
+		fmt.Fprintf(&b, "- %s | %s | %s | %s\n", e.Alias, e.Email, e.KeyType, e.Fingerprint)
 	}
 	return b.String()
 }
@@ -2010,6 +2105,7 @@ func loadVault(path string, passphrase []byte) ([]keyEntry, vaultSettings, bool,
 
 func encodeVaultPayload(entries []keyEntry, settings vaultSettings) ([]byte, error) {
 	settings, _ = normalizeVaultSettings(settings)
+	entries, _ = normalizeEntries(entries)
 	payload := vaultData{
 		Version:  2,
 		Settings: settings,
@@ -2030,15 +2126,17 @@ func decodeVaultPayload(data []byte) ([]keyEntry, vaultSettings, bool, error) {
 		if entries == nil {
 			entries = []keyEntry{}
 		}
-		return entries, settings, changed, nil
+		normalizedEntries, entriesChanged := normalizeEntries(entries)
+		return normalizedEntries, settings, changed || entriesChanged, nil
 	}
 
 	entries, err := decodeCSV(data)
 	if err != nil {
 		return nil, vaultSettings{}, false, err
 	}
+	normalizedEntries, _ := normalizeEntries(entries)
 	settings := defaultVaultSettings()
-	return entries, settings, true, nil
+	return normalizedEntries, settings, true, nil
 }
 
 func deriveKey(passphrase, salt []byte) []byte {
@@ -2048,11 +2146,11 @@ func deriveKey(passphrase, salt []byte) []byte {
 func encodeCSV(entries []keyEntry) ([]byte, error) {
 	var b bytes.Buffer
 	w := csv.NewWriter(&b)
-	if err := w.Write([]string{"ID", "Alias", "KeyType", "KeyData", "Fingerprint", "CreationDate"}); err != nil {
+	if err := w.Write([]string{"ID", "PairID", "Alias", "Email", "KeyType", "KeyData", "Fingerprint", "CreationDate"}); err != nil {
 		return nil, err
 	}
 	for _, e := range entries {
-		if err := w.Write([]string{e.ID, e.Alias, string(e.KeyType), e.KeyData, e.Fingerprint, e.CreationDate}); err != nil {
+		if err := w.Write([]string{e.ID, e.PairID, e.Alias, e.Email, string(e.KeyType), e.KeyData, e.Fingerprint, e.CreationDate}); err != nil {
 			return nil, err
 		}
 	}
@@ -2077,19 +2175,114 @@ func decodeCSV(data []byte) ([]keyEntry, error) {
 		if i == 0 {
 			continue
 		}
-		if len(row) != 6 {
+		if len(row) != 6 && len(row) != 8 {
+			continue
+		}
+		if len(row) == 6 {
+			entries = append(entries, keyEntry{
+				ID:           row[0],
+				Alias:        row[1],
+				KeyType:      keyType(row[2]),
+				KeyData:      row[3],
+				Fingerprint:  row[4],
+				CreationDate: row[5],
+			})
 			continue
 		}
 		entries = append(entries, keyEntry{
 			ID:           row[0],
-			Alias:        row[1],
-			KeyType:      keyType(row[2]),
-			KeyData:      row[3],
-			Fingerprint:  row[4],
-			CreationDate: row[5],
+			PairID:       row[1],
+			Alias:        row[2],
+			Email:        row[3],
+			KeyType:      keyType(row[4]),
+			KeyData:      row[5],
+			Fingerprint:  row[6],
+			CreationDate: row[7],
 		})
 	}
 	return entries, nil
+}
+
+func normalizeEntries(entries []keyEntry) ([]keyEntry, bool) {
+	if entries == nil {
+		return []keyEntry{}, true
+	}
+
+	out := make([]keyEntry, len(entries))
+	copy(out, entries)
+	changed := false
+
+	seenIDs := make(map[string]struct{})
+	for i := range out {
+		id := strings.TrimSpace(out[i].ID)
+		if id == "" {
+			id = newUUID()
+			changed = true
+		}
+		for {
+			if _, exists := seenIDs[id]; !exists {
+				break
+			}
+			id = newUUID()
+			changed = true
+		}
+		out[i].ID = id
+		seenIDs[id] = struct{}{}
+	}
+
+	type ownerKey struct {
+		alias string
+		email string
+		fp    string
+	}
+	ownerKeyOf := func(e keyEntry) ownerKey {
+		return ownerKey{alias: e.Alias, email: e.Email, fp: e.Fingerprint}
+	}
+
+	pubQueues := make(map[ownerKey][]int)
+	for i := range out {
+		if out[i].KeyType != ownerPublic {
+			continue
+		}
+		k := ownerKeyOf(out[i])
+		pubQueues[k] = append(pubQueues[k], i)
+	}
+
+	for i := range out {
+		if out[i].KeyType != ownerPrivate {
+			continue
+		}
+		pairID := strings.TrimSpace(out[i].PairID)
+		if pairID == "" {
+			pairID = out[i].ID
+			out[i].PairID = pairID
+			changed = true
+		}
+
+		k := ownerKeyOf(out[i])
+		queue := pubQueues[k]
+		for len(queue) > 0 {
+			pubIdx := queue[0]
+			queue = queue[1:]
+			if strings.TrimSpace(out[pubIdx].PairID) == "" {
+				out[pubIdx].PairID = pairID
+				changed = true
+				break
+			}
+		}
+		pubQueues[k] = queue
+	}
+
+	for i := range out {
+		if out[i].KeyType == ownerPrivate || out[i].KeyType == ownerPublic {
+			if strings.TrimSpace(out[i].PairID) == "" {
+				out[i].PairID = out[i].ID
+				changed = true
+			}
+		}
+	}
+
+	return out, changed
 }
 
 func newUUID() string {

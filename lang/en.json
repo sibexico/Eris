@@ -52,6 +52,8 @@
   "Generate key pair": "Generate key pair",
   "Show public key": "Show public key",
   "Copy": "Copy",
+  "Copy fingerprint": "Copy fingerprint",
+  "Fingerprint copied": "Fingerprint copied",
   "Public key copied": "Public key copied",
   "Show private key": "Show private key",
   "Hide private key": "Hide private key",

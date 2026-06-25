@@ -429,18 +429,20 @@ func TestDeriveKeyAndEncodingHelpers(t *testing.T) {
 
 func TestUIStateKeyHelpers(t *testing.T) {
 	s := &uiState{
+		recipientOptionToID: make(map[string]string),
+		signerOptionToID:    make(map[string]string),
 		entries: []keyEntry{
-			{Alias: "owner1", KeyType: ownerPublic, KeyData: b64("owner1-public"), Fingerprint: "fp1"},
-			{Alias: "owner1", KeyType: ownerPrivate, KeyData: b64("owner1-private"), Fingerprint: "fp1"},
-			{Alias: "contact1", KeyType: thirdParty, KeyData: b64("contact1-public"), Fingerprint: "fp2"},
+			{ID: "owner-public-id", PairID: "pair-1", Alias: "owner1", Email: "owner@example.com", KeyType: ownerPublic, KeyData: b64("owner1-public"), Fingerprint: "fp1"},
+			{ID: "owner-private-id", PairID: "pair-1", Alias: "owner1", Email: "owner@example.com", KeyType: ownerPrivate, KeyData: b64("owner1-private"), Fingerprint: "fp1"},
+			{ID: "contact-id", Alias: "contact1", KeyType: thirdParty, KeyData: b64("contact1-public"), Fingerprint: "fp2"},
 		},
 	}
 
-	if k := s.findKey("owner1", ownerPrivate); k == nil || deb64(k.KeyData) != "owner1-private" {
-		t.Fatalf("findKey did not return expected owner private key")
+	if k := s.findKeyByID("owner-private-id", ownerPrivate); k == nil || deb64(k.KeyData) != "owner1-private" {
+		t.Fatalf("findKeyByID did not return expected owner private key")
 	}
-	if k := s.findKey("missing", ownerPrivate); k != nil {
-		t.Fatalf("findKey should return nil for missing alias")
+	if k := s.findKeyByID("missing", ownerPrivate); k != nil {
+		t.Fatalf("findKeyByID should return nil for missing id")
 	}
 
 	pairs := s.ownerPairs()
@@ -451,14 +453,20 @@ func TestUIStateKeyHelpers(t *testing.T) {
 		t.Fatalf("unexpected owner pair values: %+v", pairs[0])
 	}
 
-	recipients := s.encryptOptionsRecipient()
-	if len(recipients) != 2 || recipients[1] != "contact1" {
+	recipients, recipientMap := s.encryptOptionsRecipient()
+	if len(recipients) != 2 {
 		t.Fatalf("unexpected recipient options: %#v", recipients)
 	}
+	if recipientMap[recipients[1]] != "contact-id" {
+		t.Fatalf("unexpected recipient option mapping: %#v", recipientMap)
+	}
 
-	signers := s.encryptOptionsSigner()
-	if len(signers) != 2 || signers[1] != "owner1" {
+	signers, signerMap := s.encryptOptionsSigner()
+	if len(signers) != 2 {
 		t.Fatalf("unexpected signer options: %#v", signers)
+	}
+	if signerMap[signers[1]] != "owner-private-id" {
+		t.Fatalf("unexpected signer option mapping: %#v", signerMap)
 	}
 }
 
