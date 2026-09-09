@@ -28,7 +28,9 @@ jobs:
         run: |
           set -euo pipefail
           sudo apt-get update
-          sudo apt-get install -y build-essential pkg-config xorg-dev libgl1-mesa-dev
+          sudo apt-get install -y \
+            build-essential pkg-config xorg-dev libgl1-mesa-dev \
+            libwayland-dev libxkbcommon-dev
 
       - name: Run tests with coverage
         id: tests
@@ -184,9 +186,11 @@ jobs:
               gcc-aarch64-linux-gnu g++-aarch64-linux-gnu libc6-dev-arm64-cross \
               libgl1-mesa-dev:arm64 libx11-dev:arm64 libxcursor-dev:arm64 \
               libxinerama-dev:arm64 libxi-dev:arm64 libxrandr-dev:arm64 \
-              libxxf86vm-dev:arm64
+              libxxf86vm-dev:arm64 libwayland-dev:arm64 libxkbcommon-dev:arm64
           else
-            sudo apt-get install -y build-essential pkg-config xorg-dev libgl1-mesa-dev dpkg-dev lintian
+            sudo apt-get install -y \
+              build-essential pkg-config xorg-dev libgl1-mesa-dev \
+              libwayland-dev libxkbcommon-dev dpkg-dev lintian
           fi
 
       - name: Install LLVM-MinGW toolchain for Windows ARM64 cross build
