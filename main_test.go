@@ -668,6 +668,7 @@ func TestNormalizeLanguageCode(t *testing.T) {
 	}{
 		{"", "en"},
 		{"es_ES.UTF-8", "es"},
+		{"zh_CN.UTF-8", "zh"},
 		{"en-US", "en"},
 		{"pt_BR", "pt"},
 		{"C", "en"},
@@ -694,6 +695,12 @@ func TestNewLocalizerAndTranslationLookup(t *testing.T) {
 	}
 	if !l.SetLanguage("en") {
 		t.Fatalf("expected SetLanguage(en) to succeed")
+	}
+	if !l.SetLanguage("zh-CN") {
+		t.Fatalf("expected SetLanguage(zh-CN) to succeed")
+	}
+	if got := l.T("Settings"); got != "设置" {
+		t.Fatalf("expected Simplified Chinese Settings translation, got %q", got)
 	}
 	if l.T("does-not-exist") != "does-not-exist" {
 		t.Fatalf("unknown translation keys should fall back to source text")

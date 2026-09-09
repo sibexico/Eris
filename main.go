@@ -724,10 +724,13 @@ func (s *uiState) showMainUI() {
 
 func (s *uiState) buildSettingsTab() fyne.CanvasObject {
 	languageLabel := widget.NewLabel(s.tr("Language"))
-	s.languageSel = widget.NewSelect([]string{s.tr("English"), s.tr("Spanish")}, func(selected string) {
+	s.languageSel = widget.NewSelect([]string{s.tr("English"), s.tr("Spanish"), s.tr("Simplified Chinese")}, func(selected string) {
 		code := "en"
-		if selected == s.tr("Spanish") {
+		switch selected {
+		case s.tr("Spanish"):
 			code = "es"
+		case s.tr("Simplified Chinese"):
+			code = "zh"
 		}
 		if code == appLocalizer.Language() {
 			return
@@ -742,6 +745,8 @@ func (s *uiState) buildSettingsTab() fyne.CanvasObject {
 	})
 	if appLocalizer.Language() == "es" {
 		s.languageSel.SetSelected(s.tr("Spanish"))
+	} else if appLocalizer.Language() == "zh" {
+		s.languageSel.SetSelected(s.tr("Simplified Chinese"))
 	} else {
 		s.languageSel.SetSelected(s.tr("English"))
 	}
