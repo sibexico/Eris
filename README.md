@@ -4,8 +4,8 @@
 ![Go Version](https://img.shields.io/badge/Go-1.26.1-blue?labelColor=gray&logo=go)
  [![Support Me](https://img.shields.io/badge/Support-Me-darkgreen?labelColor=black&logo=data:image/svg%2Bxml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHZpZXdCb3g9IjAgMCAyNCAyNCI%2BPHBhdGggZmlsbD0iI0ZGRiIgZmlsbC1ydWxlPSJldmVub2RkIiBjbGlwLXJ1bGU9ImV2ZW5vZGQiIGQ9Ik0xMiAxQzUuOTI1IDEgMSA1LjkyNSAxIDEyczQuOTI1IDExIDExIDExIDExLTQuOTI1IDExLTExUzE4LjA3NSAxIDEyIDF6bTAgNGwyLjUgNi41SDIxbC01LjUgNCAyIDYuNUwxMiAxNy41IDYgMjJsMi02LjUtNS41LTRoNi41TDEyIDV6Ii8%2BPC9zdmc%2B)](https://sibexi.co/support)
 
-[![Tests passed](https://img.shields.io/badge/Tests-Failed-red?labelColor=gray&logo=github)](https://github.com/sibexico/Eris/actions/runs/28153438505)
- [![Tests coverage](https://img.shields.io/badge/Tests%20Coverage-67.5%25-yellow?labelColor=gray&logo=gitextensions)](https://github.com/sibexico/Eris/actions/runs/28153438505)
+[![Tests passed](https://img.shields.io/badge/Tests-Failed-red?labelColor=gray&logo=github)](https://github.com/sibexico/Eris/actions/runs/34415802912)
+ [![Tests coverage](https://img.shields.io/badge/Tests%20Coverage-0.0%25-red?labelColor=gray&logo=gitextensions)](https://github.com/sibexico/Eris/actions/runs/34415802912)
 
 # Eris
 
